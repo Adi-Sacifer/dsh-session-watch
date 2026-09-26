@@ -1,0 +1,16 @@
+# Bundle patch for dsh-session-watch (mode 3: always-on session monitoring).
+#
+# Inserted, not patched: this id does not exist in any lower bundle layer.
+#
+# Config:
+#   intervalSeconds  how often the transcript metadata is re-read (default 15)
+#   staleSeconds     how long a session may be silent with a turn open before it is flagged
+#                    (default 300; too low and every slow model response becomes an alarm)
+#   windowMinutes    ignore sessions not touched in this long (default 1440)
+- insert:
+    - id: session-watch
+      name: '@local/dsh-session-watch'
+      config:
+        intervalSeconds: 15
+        staleSeconds: 300
+        windowMinutes: 1440

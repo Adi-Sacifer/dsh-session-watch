@@ -46,7 +46,36 @@ turn/start → step/start → assistant/message → tool/call → tool/result �
 | 有没配对的 `tool/call` | 还在长 | **正在干活** |
 | 有没配对的 `tool/call` | **停笔超过阈值** | **卡住了** ⚠️ |
 
-## 用法
+## 三种用法（选一个，别混）
+
+| 模式 | 什么时候动 | 谁能用 | 状态 |
+|---|---|---|---|
+| **1 按需看** | 你问一句 | `scripts/probe-sessions.mjs` | ✅ 实测 |
+| **2 本轮盯** | 本轮内每 N 秒 | `scripts/watch-sessions.mjs` | ✅ 实测（抓到 4 次卡住→恢复） |
+| **3 常驻盯** | 与我在不在线无关 | `plugin/`（DSH 宿主插件） | ⚠️ 宿主半边在跑，界面半边待重启 |
+
+### 模式2：本轮盯
+
+```powershell
+node scripts/watch-sessions.mjs --interval 60 --stale 300
+```
+
+只报**状态变化**：某个会话从"干活"翻成"卡住"、或者卡住又恢复，才打印一行。空转时**故意什么都不输出**——一个每 30 秒喊一次"一切正常"的看门狗，只会训练你忽略它。同时每几分钟打一行心跳，让你能区分"安静"和"死了"。
+
+迁移记录写进 `~/.dsh/session-watch/watch.jsonl`，当前状态写进 `state.json`，所以它随本轮结束而死之后，**下一轮还能读到这中间发生了什么**。
+
+### 模式3：常驻插件
+
+```powershell
+# 安装（宿主半边立刻生效，界面半边需要重启宿主才出现）
+plugin_manager install_bundle  target: file:<本仓库>/plugin
+```
+
+装好后它自己起定时器、每 15 秒扫一次，并把结果放在 `GET /session-watch/state`。界面半边（`plugin/client.js`）会在页面顶部弹一条提示，列出卡住的会话。
+
+**为什么宿主半边要自带一份判据**：插件会被装进 profile，而 workspace 路径可能被移动或缺失，所以它不能 `import` 这个仓库里的 `scan.mjs`。代价是判据存在两份——**所以两份都有测试钉着**（`test/selftest.mjs` 管工具那份，`test/plugin-selfcheck.mjs` 管插件那份）。不钉住的话其中一份会漂移，看门狗就会喊狼来了。
+
+### 模式1：按需看
 
 ```powershell
 node scripts/probe-sessions.mjs                 # 默认：90 分钟内活跃的会话

@@ -1,0 +1,19 @@
+{
+  "name": "@local/dsh-session-watch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Marks conversations that stopped writing while a turn or tool call is still open.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
