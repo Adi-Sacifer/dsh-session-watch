@@ -24,12 +24,17 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import zlib from 'node:zlib';
+import { randomUUID } from 'node:crypto';
+import { readRecords, hasZstd, unavailableReason } from './archive.js';
+import { diagnose } from './diagnose.js';
 
 export const name = 'session-watch';
 
-/* `timer` provides ctx.interval and ctx.timeout; `webServer` carries the routes. */
-export const inject = ['timer', 'webServer'];
+/*
+ * `timer` provides ctx.interval and ctx.timeout; `webServer` carries the routes; `agents` is how a
+ * diagnosis reaches a live conversation as a real message rather than a log line.
+ */
+export const inject = ['timer', 'webServer', 'agents'];
 
 /*
  * RELOAD SAFETY - this plugin must survive being applied more than once in one process.
@@ -59,39 +64,13 @@ const MOUNTED = new Set();
 
 const ROUTE = `/session-watch/state-${LOAD_STAMP}.json`;
 const NOTICE_ROUTE = `/session-watch/notice-${LOAD_STAMP}.js`;
-const MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+const WATCHER_ROUTE = `/session-watch/watcher-${LOAD_STAMP}.json`;
 
 const DSH = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const SESS_ROOT = path.join(DSH, 'sessions');
 const PROJ_CACHE = path.join(DSH, 'storages', 'session_projcache', 'sessions');
 
-const hasZstd = typeof zlib.zstdDecompressSync === 'function';
-
-/*
- * The transcript is an append-only log of INDEPENDENT zstd frames. A plain decompress returns
- * only the first frame and looks like an empty conversation, so walk the frame magic instead.
- */
-function readRecords(file) {
-  const buf = fs.readFileSync(file);
-  const offs = [];
-  for (let i = 0; i < buf.length - 3; i++) {
-    if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) offs.push(i);
-  }
-  offs.push(buf.length);
-  const parts = [];
-  for (let k = 0; k < offs.length - 1; k++) {
-    try { parts.push(zlib.zstdDecompressSync(buf.subarray(offs[k], offs[k + 1]))); continue; } catch { }
-    for (let j = k + 2; j < offs.length; j++) {
-      try { parts.push(zlib.zstdDecompressSync(buf.subarray(offs[k], offs[j]))); k = j - 1; break; } catch { }
-    }
-  }
-  const out = [];
-  for (const line of Buffer.concat(parts).toString('utf8').split('\n')) {
-    if (!line) continue;
-    try { out.push(JSON.parse(line)); } catch { }
-  }
-  return out;
-}
+/* transcript reading, zstd availability and the frame-magic rule all live in archive.js */
 
 function titleOf(id) {
   try {
@@ -170,14 +149,132 @@ export function apply(ctx, config) {
   const staleS = Math.max(30, Number(config?.staleSeconds ?? 300));
   const windowMin = Math.max(10, Number(config?.windowMinutes ?? 1440));
 
+  /*
+   * Diagnosis configuration.
+   *
+   * The user authorized, in their own words, that a stuck session may be inspected automatically
+   * so the cause can be reported: "就要第二个" - the option that explicitly includes reading the
+   * stuck session's recent messages. That authorization is why contentBudget is non-zero by
+   * default, and it is recorded in every result so the reading can be audited rather than assumed.
+   * Setting contentBudget to 0 leaves diagnosis structure-only; nothing else needs to change.
+   */
+  const contentBudget = Math.max(0, Number(config?.diagnosisMessages ?? 3));
+  const diagnosisEnabled = config?.diagnose !== false;
+  const authorizedBy = String(config?.diagnosisAuthorizedBy ?? 'user authorized automatic read of the stuck session');
+  const notifyEnabled = config?.notifyOnStuck !== false;
+  const notifySessionId = config?.notifySessionId ? String(config.notifySessionId) : null;
+
+  /* Which live conversation should hear about a diagnosis. The browser reports its own session id;
+   * config can pin one as a fallback. Nothing is hardcoded, because a session id is not stable. */
+  let watcherSessionId = null;
+  const notified = new Map();   // session id -> last diagnosis cause we already reported
+
   let snapshot = {
     at: Date.now(),
     staleSeconds: staleS,
     available: hasZstd,
-    reason: hasZstd ? null : `zstd decompression unavailable in this runtime (node ${process.versions.node}); the plugin cannot read transcripts`,
+    reason: unavailableReason,
+    diagnosis: { enabled: diagnosisEnabled, contentBudget, authorizedBy },
     counts: { stuck: 0, working: 0, idle: 0, unreadable: 0 },
     stuck: [],
     sessions: [],
+    notifications: [],
+  };
+
+  /**
+   * Tell a live conversation about a stuck session, as a real message.
+   *
+   * `agent.followup(text)` queues the message AND wakes the driver, so this actually reaches a
+   * person instead of sitting in a log. Verified in the agent loop source:
+   *   followup(input) { this.send(input, "next-turn", true); }   // true = wake
+   *
+   * Deliberately NOT steer() or inject(): those act inside a turn that is already running, and the
+   * whole point is to leave a working conversation alone.
+   *
+   * WHO GETS IT, and why not "everyone": recipients are the ROOTS - top-level conversations - which
+   * is where a person sits. Subagents and team members are workers; waking them to report on a peer
+   * would be noise at best and a feedback loop at worst, since they could be the stuck one.
+   *
+   * The target is never hardcoded, because a session id is not stable. The page cannot supply its
+   * own id either (no session id is exposed to the browser), so the roots ARE the mechanism, with
+   * `notifySessionId` available as an override.
+   */
+  const notify = (diagnosis, title) => {
+    if (!notifyEnabled || !diagnosisEnabled) return { delivered: false, reason: '通知已关闭' };
+
+    const recipients = [];
+    const wanted = watcherSessionId ?? notifySessionId;
+    try {
+      if (wanted) {
+        const agent = ctx.agents?.get?.(wanted);
+        if (agent) recipients.push(agent);
+        else return { delivered: false, reason: `指定的通知目标 ${wanted} 当前不是活的` };
+      } else {
+        for (const agent of ctx.agents?.roots?.() ?? []) {
+          if (agent && typeof agent.followup === 'function') recipients.push(agent);
+        }
+      }
+    } catch (error) {
+      return { delivered: false, reason: `无法枚举会话：${error?.message ?? error}` };
+    }
+
+    if (recipients.length === 0) return { delivered: false, reason: '当前没有可通知的顶层会话' };
+
+    const lines = [
+      `【会话监视】另一个对话卡住了，原因如下。我没有碰它，它仍然停在那里。`,
+      ``,
+      `· 会话：${title ?? diagnosis.id}（${diagnosis.id}）`,
+      `· 原因：${diagnosis.summary}`,
+      diagnosis.detail ? `· 细节：${diagnosis.detail}` : null,
+      `· 置信度：${diagnosis.confidence}　静默：${diagnosis.quietSeconds}s`,
+      diagnosis.read?.length
+        ? `· 读了什么：${diagnosis.read.join('、')}（授权：${diagnosis.authorizedBy}）`
+        : `· 读了什么：只看了结构信息（${diagnosis.structureRead ?? '尾部记录'}），没有读对话内容`,
+      diagnosis.lastAssistant?.length ? `· 它最后一句话：${diagnosis.lastAssistant[diagnosis.lastAssistant.length - 1].text}` : null,
+      diagnosis.lastUser?.length ? `· 你最后对它说的：${diagnosis.lastUser[diagnosis.lastUser.length - 1].text}` : null,
+      diagnosis.lastErrorResult ? `· 最近的错误结果：${diagnosis.lastErrorResult.text}` : null,
+      ``,
+      `要我：① 去看一眼现状 ② 什么都不做让它继续 ③ 试试把它打断？`,
+    ].filter((x) => x !== null);
+    const body = lines.join('\n');
+
+    /*
+     * The inbox wants a MESSAGE OBJECT, not a string.
+     *
+     * `followup(input)` hands `input` straight to `send()`, which stores it without normalizing,
+     * and the loop later appends it as a `user/message` event. So a bare string would be appended
+     * as an invalid event. The minimal valid shape comes from the llm package's own helpers:
+     *   createUserMessage(input) -> createMessage({ ...input, role: 'user' })
+     *   createMessage(input)     -> structuredClone({ ...input, id: randomUUID() })
+     * i.e. { id, role: 'user', content: [{ type: 'text', text }], source: { kind: … } }.
+     *
+     * `source.kind` is set explicitly and is NOT 'user': the goal tool's own documentation says an
+     * omitted source resolves to `user`, and that non-human producers must supply their own rather
+     * than inherit the authority of something a human typed. A watchdog is not the human.
+     */
+    const makeMessage = (text) => ({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'session-watch' },
+    });
+
+    const delivered = [];
+    const failed = [];
+    for (const agent of recipients) {
+      if (agent.id === diagnosis.id) continue;   // never report a session to itself
+      try {
+        agent.followup(makeMessage(body));
+        delivered.push(agent.id);
+      } catch (error) {
+        failed.push(`${agent.id}: ${error?.message ?? error}`);
+      }
+    }
+    if (delivered.length > 0) {
+      ctx.logger?.info?.(`session-watch: reported ${diagnosis.id} (${diagnosis.cause}) to ${delivered.join(', ')}`);
+      return { delivered: true, to: delivered };
+    }
+    return { delivered: false, reason: failed.length ? failed.join('; ') : '没有可用的接收方（被诊断的会话可能就是唯一顶层会话）' };
   };
 
   const tick = () => {
@@ -188,14 +285,43 @@ export function apply(ctx, config) {
       const rows = scope.map((s) => verdictOf(s, { now, staleS }));
       const pick = (state) => rows.filter((r) => r.state === state);
 
+      /* diagnose only what the verdict flagged, and only once per cause per session */
+      const stuck = pick('stuck').map((r) => {
+        const source = scope.find((s) => s.id === r.id);
+        let d = null;
+        if (diagnosisEnabled && source) {
+          d = diagnose({
+            file: source.file,
+            mtime: source.mtime,
+            now,
+            staleSeconds: staleS,
+            contentBudget,
+            authorizedBy,
+          });
+        }
+        return { ...r, diagnosis: d };
+      });
+
       const next = {
         at: now,
         staleSeconds: staleS,
         available: true,
         reason: null,
-        counts: { stuck: pick('stuck').length, working: pick('working').length, idle: pick('idle').length, unreadable: pick('unreadable').length },
-        stuck: pick('stuck').map((r) => ({ id: r.id, title: r.title, quietSeconds: r.quietSeconds, tail: r.tail })),
+        diagnosis: { enabled: diagnosisEnabled, contentBudget, authorizedBy },
+        counts: { stuck: stuck.length, working: pick('working').length, idle: pick('idle').length, unreadable: pick('unreadable').length },
+        stuck: stuck.map((r) => ({
+          id: r.id,
+          title: r.title,
+          quietSeconds: r.quietSeconds,
+          tail: r.tail,
+          cause: r.diagnosis?.cause ?? null,
+          summary: r.diagnosis?.summary ?? null,
+          detail: r.diagnosis?.detail ?? null,
+          confidence: r.diagnosis?.confidence ?? null,
+          read: r.diagnosis?.read ?? [],
+        })),
         sessions: rows.map((r) => ({ id: r.id, state: r.state, quietSeconds: r.quietSeconds, tail: r.tail })),
+        notifications: snapshot.notifications ?? [],
       };
 
       /* announce transitions so a consumer can react without polling */
@@ -205,7 +331,22 @@ export function apply(ctx, config) {
         if (was !== s.state && (s.state === 'stuck' || was === 'stuck')) {
           ctx.emit('session-watch/changed', { id: s.id, title: s.title, from: was ?? null, to: s.state, quietSeconds: s.quietSeconds, tail: s.tail });
           ctx.logger?.info?.(`session-watch: ${was ?? 'new'} -> ${s.state}  ${s.id}  quiet ${s.quietSeconds}s`);
+
+          /* a new arrival in the stuck state gets a diagnosis and, if possible, a message */
+          const row = stuck.find((r) => r.id === s.id);
+          if (s.state === 'stuck' && row?.diagnosis) {
+            if (notified.get(s.id) !== row.diagnosis.cause) {
+              const result = notify(row.diagnosis, row.title);
+              notified.set(s.id, row.diagnosis.cause);
+              next.notifications = [...(snapshot.notifications ?? []), {
+                at: now, id: s.id, title: row.title, cause: row.diagnosis.cause,
+                summary: row.diagnosis.summary, delivered: Boolean(result?.delivered), reason: result?.reason ?? null,
+              }].slice(-20);
+            }
+            ctx.logger?.info?.(`session-watch diagnosis ${s.id}: ${row.diagnosis.cause} — ${row.diagnosis.summary}`);
+          }
         }
+        if (was === 'stuck' && s.state !== 'stuck') notified.delete(s.id);   // re-arm after recovery
       }
       snapshot = next;
     } catch (error) {
@@ -274,6 +415,36 @@ export function apply(ctx, config) {
   });
 
   /*
+   * The page tells us which conversation it is showing.
+   *
+   * A session id is not stable and must never be hardcoded, so the notice posts its own id and this
+   * becomes the notification target. Self-selecting this way means the person looking at the GUI is
+   * the person who gets told, without any configuration.
+   */
+  ctx.webServer.register({
+    method: 'POST',
+    path: WATCHER_ROUTE,
+    handler: (req, res) => {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk; if (raw.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const body = JSON.parse(raw || '{}');
+          const id = typeof body.sessionId === 'string' && body.sessionId.trim() !== '' ? body.sessionId.trim() : null;
+          if (id !== null && id !== watcherSessionId) {
+            watcherSessionId = id;
+            ctx.logger?.info?.(`session-watch: will report stuck sessions to ${id}`);
+          } else if (id !== null) {
+            watcherSessionId = id;   // keep it live: the page may move between conversations
+          }
+        } catch { /* a malformed body is ignored; this route only ever sets one field */ }
+        res.writeHead(204, { 'cache-control': 'no-store' });
+        res.end();
+      });
+    },
+  });
+
+  /*
    * The UI.
    *
    * A normal client half (`dsh.client` + `exports["./client"]`) is served only if the browser's
@@ -309,8 +480,9 @@ export function apply(ctx, config) {
     });
 
     ctx.on('webserver/index-inject', (table) => {
-      /* the state URL travels on the script tag, so the notice never has to guess a stale-able path */
-      const tag = `<script src="${NOTICE_ROUTE}" data-session-watch-state="${ROUTE}" defer></script>`;
+      /* the state URL and the watcher URL travel on the script tag, so the notice never guesses a
+       * path that a reload would stale */
+      const tag = `<script src="${NOTICE_ROUTE}" data-session-watch-state="${ROUTE}" data-session-watch-watcher="${WATCHER_ROUTE}" defer></script>`;
       table.push({ kind: 'script', placement: 'body', text: `document.write(${JSON.stringify(tag)})` });
     });
   }

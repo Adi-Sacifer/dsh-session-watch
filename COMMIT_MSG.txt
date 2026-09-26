@@ -1,0 +1,42 @@
+session-watch: work out WHY a session is stuck, and say so out loud
+
+The user asked whether the plugin would diagnose a problem and notify them, not just flag it.
+It did not. Now it does both.
+
+DIAGNOSIS (plugin/diagnose.js)
+  Structure first: which record the transcript died on, how long ago, and the pending tool's
+  name and arguments. That last one is where the single most useful fact comes from - "it is
+  stuck on THIS command" - and it needs no permission, being the same metadata the verdict
+  already reads.
+
+  Then, because the user explicitly authorized it, the last few messages within a budget: the
+  last assistant sentence, the last human instruction, a recent error result. Reasoning blocks
+  are never read at any budget - they share the content array with visible text, so filtering
+  by type keeps private thinking out - and that has its own assertion.
+
+  Four causes, with confidence that is honest about its own weakness:
+    tool-call-hung                    high once silence passes twice the threshold
+    model-not-responding              LOW: a slow model looks identical
+    model-waiting-after-tool-result   LOW, same reason
+    not-stuck                         a closed turn must never be dressed up as a cause
+
+NOTIFICATION (agent.followup)
+  Recipients are the ROOTS - top-level conversations, where a person sits - never subagents,
+  and never the stuck session itself. Once per cause, not once per tick, re-armed on recovery.
+  Config can pin a single target instead.
+
+  The payload is a message object, not a string, and getting that wrong would have been silent:
+  followup stores its argument unnormalized and the loop later appends it as a user/message
+  event. The shape was taken from the llm package's own helpers rather than guessed -
+  createUserMessage() -> createMessage() adds only the role and a randomUUID - so the payload is
+  { id, role: 'user', content: [{type:'text',text}], source:{kind:'session-watch'} }. The source
+  is NOT 'user': the goal tool's docs say an omitted source resolves to user and that non-human
+  producers must supply their own rather than inherit a human's authority.
+
+TWO BUGS THE TESTS CAUGHT IN MY OWN CODE
+  1. The content layer returned its fields nested under `context`, while every caller read them
+     at the top level - so notifications would have carried no content at all.
+  2. The message payload was a bare string, which the loop would have appended as invalid data.
+  Neither would have failed loudly. Both are now pinned.
+
+147 assertions across six suites, run in both the repo and the installed skill directory.

@@ -7,10 +7,24 @@
 #   staleSeconds     how long a session may be silent with a turn open before it is flagged
 #                    (default 300; too low and every slow model response becomes an alarm)
 #   windowMinutes    ignore sessions not touched in this long (default 1440)
+#
+# Diagnosis and notification:
+#   diagnose              false turns the whole diagnosis pass off (default true)
+#   diagnosisMessages     how many recent messages the diagnosis may read (default 3).
+#                         Set 0 to keep it structure-only: it will still name the tool and the
+#                         command it died on, but will not read anything that was said.
+#   diagnosisAuthorizedBy recorded verbatim in every result, so an audit can see who allowed the
+#                         content read. Defaults to the user's own grant.
+#   notifyOnStuck         false stops the message while keeping diagnosis (default true)
+#   notifySessionId       pin one recipient instead of every top-level conversation
 - insert:
-    - id: session-watch-v2
+    - id: session-watch
       name: '@local/dsh-session-watch'
       config:
         intervalSeconds: 15
         staleSeconds: 300
         windowMinutes: 1440
+        diagnose: true
+        diagnosisMessages: 3
+        notifyOnStuck: true
+

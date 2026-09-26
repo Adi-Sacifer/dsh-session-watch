@@ -59,7 +59,20 @@ function makeHost() {
 /* 1. the first apply registers both routes and starts one timer */
 const host = makeHost();
 plugin.apply(host.ctx, { intervalSeconds: 15 });
-check('first apply registers two routes', host.state.registered.length, 2);
+/*
+ * Three routes, and the count is asserted by KIND rather than by number.
+ * A bare number here would break every time the plugin legitimately grows a route (it already did,
+ * when the diagnosis feature added the watcher POST), which trains you to edit the expectation
+ * instead of reading it. Naming the kinds makes a new route a deliberate decision.
+ */
+const routeKinds = (list) => list.map((r) => {
+  if (r.includes('/state-')) return 'state';
+  if (r.includes('/notice-')) return 'notice';
+  if (r.includes('/watcher-')) return 'watcher';
+  return 'UNKNOWN:' + r;
+}).sort().join(',');
+
+check('first apply registers the three routes', routeKinds(host.state.registered), 'notice,state,watcher');
 check('first apply starts one interval', host.state.intervals, 1);
 check('first apply subscribes the injection listener', host.state.injectListeners, 1);
 check('first apply never hits a duplicate', host.state.throwCount, 0);
@@ -72,12 +85,12 @@ try {
   secondThrew = String(error?.message ?? error);
 }
 check('second apply does not throw the duplicate-route error', secondThrew, null);
-check('second apply registers nothing new', host.state.registered.length, 2);
+check('second apply registers nothing new', routeKinds(host.state.registered), 'notice,state,watcher');
 check('second apply never hits a duplicate', host.state.throwCount, 0);
 
 /* 3. and a third time, because reloads are not always tidy */
 try { plugin.apply(host.ctx, { intervalSeconds: 15 }); } catch { /* recorded below */ }
-check('third apply still leaves exactly two routes', host.state.registered.length, 2);
+check('third apply still leaves exactly three routes', routeKinds(host.state.registered), 'notice,state,watcher');
 
 /* 4. no duplicate injection rows: the page must not load the notice twice */
 const table = [];
@@ -87,11 +100,11 @@ check('injection table starts empty for this host', table.length, 0);
 
 /* 5. a stale generation must not hijack a newer one: the stamp is part of the path */
 const routes = host.state.registered.slice().sort();
-check('both route paths carry a load stamp', routes.every((r) => /\/session-watch\/(state|notice)-\d+\.(json|js)$/.test(r)), true);
-check('state and notice agree on the same stamp',
-  (routes[0].match(/-(\d+)\.(json|js)$/) || [])[1] === (routes[1].match(/-(\d+)\.(json|js)$/) || [])[1], true);
-check('the two routes are the state route and the notice route',
-  routes.map((r) => (r.includes('/state-') ? 'state' : 'notice')).join(','), 'notice,state');
+check('every route path carries a load stamp',
+  routes.every((r) => /\/session-watch\/(state|notice|watcher)-\d+\.(json|js)$/.test(r)), true);
+const stamps = new Set(routes.map((r) => (r.match(/-(\d+)\.(json|js)$/) || [])[1]));
+check('all three routes agree on ONE stamp', stamps.size, 1);
+check('the stamp is numeric', /^\d+$/.test([...stamps][0] ?? ''), true);
 
 console.log(`sandbox: ${ROOT}`);
 console.log(`${pass} assertion(s) passed`);

@@ -23,6 +23,7 @@
    */
   var HERE = document.currentScript;
   var STATE_URL = (HERE && HERE.getAttribute('data-session-watch-state')) || '/session-watch/state.json';
+  var WATCHER_URL = (HERE && HERE.getAttribute('data-session-watch-watcher')) || '/session-watch/watcher.json';
   var POLL_MS = 5000;
   var ID = 'session-watch-notice';
 
@@ -131,8 +132,17 @@
     stuck.slice(0, 4).forEach(function (s) {
       var row = document.createElement('div');
       row.className = 'sw-row';
-      row.textContent = (s.title || s.id) + ' · 静默 ' + s.quietSeconds + 's · ' + s.tail;
+      /* `summary` is the diagnosis: the notice names the cause, not just the symptom */
+      row.textContent = (s.title || s.id) + ' · 静默 ' + s.quietSeconds + 's · '
+        + (s.summary || s.tail);
       box.appendChild(row);
+      if (s.detail) {
+        var detail = document.createElement('div');
+        detail.className = 'sw-row sw-dim';
+        detail.style.paddingLeft = '10px';
+        detail.textContent = '↳ ' + s.detail;
+        box.appendChild(detail);
+      }
     });
 
     if (stuck.length > 4) {
@@ -145,7 +155,12 @@
     var why = document.createElement('div');
     why.className = 'sw-dim';
     why.style.marginTop = '3px';
-    why.textContent = '判据：转录停止增长超过 ' + (state.staleSeconds || '?') + 's 且回合未收尾';
+    /* say how much was read, so the content boundary is visible rather than assumed */
+    var readNote = stuck[0] && stuck[0].read && stuck[0].read.length
+      ? '已读取：' + stuck[0].read.join('、')
+      : '只看了结构信息';
+    why.textContent = '判据：转录停止增长超过 ' + (state.staleSeconds || '?') + 's 且回合未收尾　·　'
+      + readNote + '　·　只读，没有动它';
     box.appendChild(why);
 
     el.appendChild(box);
@@ -165,9 +180,32 @@
       .catch(function () { /* host not ready: say nothing rather than shout */ });
   }
 
+  /*
+   * Introduce this page to the host, so a diagnosis has somewhere to be delivered.
+   *
+   * The browser is not told which session it is showing (no session id is exposed to the page), so
+   * this reports whatever identity IS available and lets the host fall back to notifying top-level
+   * conversations. It is best-effort on purpose: a failure here must not break the notice.
+   */
+  function identify() {
+    var payload = { sessionId: null, href: String(location.href || '') };
+    try {
+      var m = /(?:session|s)=([0-9a-f-]{8,})/i.exec(payload.href);
+      if (m) payload.sessionId = m[1];
+    } catch { /* ignore */ }
+    try {
+      fetch(WATCHER_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(function () { });
+    } catch { /* ignore */ }
+  }
+
   function start() {
     if (window.__sessionWatchNotice) return;
     window.__sessionWatchNotice = true;
+    identify();
     read();
     setInterval(read, POLL_MS);
   }
