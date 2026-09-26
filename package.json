@@ -1,0 +1,25 @@
+{
+  "name": "dsh-session-watch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Is that other agent session stuck, or just idle? Read-only, zero-dependency checks over DSH session transcripts.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Adi-Sacifer",
+  "keywords": [
+    "dsh",
+    "agent",
+    "session",
+    "transcript",
+    "watchdog",
+    "diagnostics"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/probe-sessions.mjs",
+    "peek": "node scripts/peek-text.mjs",
+    "dump": "node scripts/dump-types.mjs"
+  }
+}
