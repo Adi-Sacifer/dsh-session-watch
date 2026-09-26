@@ -55,7 +55,52 @@
     if (el) el.remove();
   }
 
+  /*
+   * A watchdog that cannot read transcripts is INDISTINGUISHABLE from a healthy system if it stays
+   * silent - both look like "all clear". That is the worst failure mode this whole repo warns
+   * about, so when the host reports `available: false` this says so out loud instead of rendering
+   * nothing. It is a distinct, dismissible line, not the stuck-session notice.
+   */
+  function renderUnavailable(state) {
+    if (dismissed) { remove(); return; }
+    ensureStyles();
+    var el = document.getElementById(ID);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = ID;
+      el.setAttribute('role', 'status');
+      document.body.appendChild(el);
+    }
+    el.style.background = 'var(--dsw-alias-bg-overlay, rgba(60,20,20,.96))';
+    el.textContent = '';
+
+    var dot = document.createElement('span');
+    dot.className = 'sw-dot';
+    dot.style.background = 'var(--dsw-alias-status-danger, #d9534f)';
+    dot.setAttribute('aria-hidden', 'true');
+    el.appendChild(dot);
+
+    var box = document.createElement('div');
+    var head = document.createElement('div');
+    head.className = 'sw-head';
+    head.textContent = '会话监视没有在工作';
+    box.appendChild(head);
+    var why = document.createElement('div');
+    why.className = 'sw-row';
+    why.textContent = state.reason || '宿主报告无法读取转录';
+    box.appendChild(why);
+    el.appendChild(box);
+
+    var close = document.createElement('button');
+    close.className = 'sw-x';
+    close.textContent = '×';
+    close.title = '本次页面内不再提示（刷新后恢复）';
+    close.onclick = function () { dismissed = true; remove(); };
+    el.appendChild(close);
+  }
+
   function render(state) {
+    if (state && state.available === false) { renderUnavailable(state); return; }
     var stuck = state && state.stuck ? state.stuck : [];
     if (dismissed || stuck.length === 0) { remove(); return; }
 
@@ -67,6 +112,8 @@
       el.setAttribute('role', 'status');
       document.body.appendChild(el);
     }
+    /* the unavailable path sets an inline background; clear it so recovery restores the stylesheet */
+    el.style.background = '';
     el.textContent = '';
 
     var dot = document.createElement('span');

@@ -185,6 +185,15 @@ check('notice does not depend on the module loader', servedScript.includes('__Mo
 check('notice reads its state URL from its own tag', servedScript.includes('data-session-watch-state'), true);
 check('notice renders nothing until a session is flagged', servedScript.includes('stuck.length === 0'), true);
 
+/*
+ * A watchdog that cannot read transcripts must SAY SO. Staying silent makes a broken monitor
+ * indistinguishable from a healthy system - the exact failure mode this repo exists to prevent -
+ * so the notice has to branch on the host's `available` flag rather than only on the stuck list.
+ */
+check('notice handles the host reporting it cannot read', servedScript.includes('available === false'), true);
+check('notice names the failure instead of staying silent', servedScript.includes('没有在工作'), true);
+check('notice explains why, from the host', servedScript.includes('state.reason'), true);
+
 /* the index-injection listener must add exactly one script row that loads the notice */
 check('subscribed to the index-injection event', subscribed.includes('webserver/index-inject'), true);
 const injectionTable = [];
