@@ -28,7 +28,7 @@ import zlib from 'node:zlib';
 
 export const name = 'session-watch';
 
-/* `timer` provides ctx.interval; `webServer` is where the UI gets its data. */
+/* `timer` provides ctx.interval and ctx.timeout; `webServer` carries the routes. */
 export const inject = ['timer', 'webServer'];
 
 /*
@@ -216,6 +216,48 @@ export function apply(ctx, config) {
 
   tick();
   ctx.interval(tick, intervalMs);
+
+  /*
+   * EVENT SUBSCRIPTION, not just the timer.
+   *
+   * A timer alone means a session is noticed only on the next tick. These listeners close that gap:
+   * a transcript that was write-busy and then closes its turn is precisely what "finished" looks
+   * like, and resolving it the moment it happens keeps a stale "stuck" from sitting on screen.
+   *
+   * Deliberately narrow. Re-scanning on EVERY tool result would turn a watcher into a busy loop and
+   * would still not be able to see a hang any sooner - a hung session by definition emits nothing.
+   * So this reacts only to a transition out of "writing" for one session, coalesced over a short
+   * window, while the timer stays the source of truth for flagging.
+   *
+   * The host half therefore uses both halves of the injected surface: `timer` for the periodic
+   * verdict and `webServer` for delivery.
+   */
+  const lastKnownState = new Map(snapshot.sessions.map((s) => [s.id, s.state]));
+  let coalesced = null;
+
+  const scheduleRescan = () => {
+    if (coalesced !== null) return;
+    coalesced = ctx.timeout(() => {
+      coalesced = null;
+      lastKnownState.clear();
+      for (const s of snapshot.sessions) lastKnownState.set(s.id, s.state);
+      tick();
+    }, 250);
+  };
+
+  for (const name of ['session/event', 'session/disposed', 'agent/status']) {
+    ctx.on(name, (...args) => {
+      try {
+        /* positional for session/*: (session, event). Object payload for agent/status: { agent, status }. */
+        const session = args[0] && args[0].id ? args[0] : args[0]?.agent?.session;
+        const id = session?.id ?? args[0]?.id ?? null;
+        if (id === null) return;
+
+        const was = lastKnownState.get(id);
+        if (was === undefined || was === 'working' || was === 'stuck') scheduleRescan();
+      } catch { /* an event listener must never break the Host */ }
+    });
+  }
 
   ctx.webServer.register({
     method: 'GET',
