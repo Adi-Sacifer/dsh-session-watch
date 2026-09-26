@@ -8,7 +8,7 @@
 #                    (default 300; too low and every slow model response becomes an alarm)
 #   windowMinutes    ignore sessions not touched in this long (default 1440)
 - insert:
-    - id: session-watch
+    - id: session-watch-v2
       name: '@local/dsh-session-watch'
       config:
         intervalSeconds: 15
