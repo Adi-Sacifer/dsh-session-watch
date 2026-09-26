@@ -31,7 +31,24 @@ export const name = 'session-watch';
 /* `timer` provides ctx.interval; `webServer` is where the UI gets its data. */
 export const inject = ['timer', 'webServer'];
 
-const ROUTE = '/session-watch/state';
+/*
+ * ROUTES ARE PER-LOAD, NOT CONSTANTS - learned the hard way.
+ *
+ * With fixed paths, reinstalling a running Host's bundle threw
+ *   webserver: duplicate undefined route "/session-watch/state"
+ * which failed the new activation AND left the previous instance orphaned but still serving, so
+ * the plugin ended up both broken and impossible to replace without a restart.
+ *
+ * So every load derives its own stamp from its own file mtime. Each generation gets fresh paths,
+ * a reload can never collide, and stale script URLs are cache-busted by the stamp.
+ */
+const LOAD_STAMP = (() => {
+  try { return String(Math.floor(fs.statSync(new URL('./index.js', import.meta.url)).mtimeMs)); }
+  catch { return String(Date.now()); }
+})();
+
+const ROUTE = `/session-watch/state-${LOAD_STAMP}.json`;
+const NOTICE_ROUTE = `/session-watch/notice-${LOAD_STAMP}.js`;
 const MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
 
 const DSH = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -193,6 +210,48 @@ export function apply(ctx, config) {
       res.end(body);
     },
   });
+
+  /*
+   * The UI.
+   *
+   * A normal client half (`dsh.client` + `exports["./client"]`) is served only if the browser's
+   * module graph already knows the package, and that graph is built at boot and then kept fresh by
+   * an HMR watch registered per package. A bundle installed into a running Host is therefore never
+   * picked up, and /plugins/<id>/client.js answers 404 until a restart. That was verified, not
+   * assumed.
+   *
+   * The index-injection route avoids the whole problem: this plugin serves its own script and adds
+   * one <script> row to the served index.html, so the notice comes alive on the next page load with
+   * no restart and no module-graph involvement. The module-loader form is kept as client.js for
+   * installs that do restart.
+   */
+  let noticeSource = null;
+  try {
+    noticeSource = fs.readFileSync(new URL('./notice.js', import.meta.url), 'utf8');
+  } catch (error) {
+    ctx.logger?.warn?.(`session-watch: notice script unreadable, UI will not appear: ${error?.message ?? error}`);
+  }
+
+  if (noticeSource !== null) {
+    ctx.webServer.register({
+      method: 'GET',
+      path: NOTICE_ROUTE,
+      handler: (req, res) => {
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8',
+          'cache-control': 'no-store',
+          'content-length': Buffer.byteLength(noticeSource),
+        });
+        res.end(noticeSource);
+      },
+    });
+
+    ctx.on('webserver/index-inject', (table) => {
+      /* the state URL travels on the script tag, so the notice never has to guess a stale-able path */
+      const tag = `<script src="${NOTICE_ROUTE}" data-session-watch-state="${ROUTE}" defer></script>`;
+      table.push({ kind: 'script', placement: 'body', text: `document.write(${JSON.stringify(tag)})` });
+    });
+  }
 
   ctx.logger?.info?.(`session-watch ready: every ${intervalMs / 1000}s, stuck after ${staleS}s of silence, zstd=${hasZstd ? 'yes' : 'NO'}`);
 }
