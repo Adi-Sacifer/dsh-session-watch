@@ -19,7 +19,12 @@
   },
   "scripts": {
     "check": "node scripts/probe-sessions.mjs",
+    "watch": "node scripts/watch-sessions.mjs",
     "peek": "node scripts/peek-text.mjs",
-    "dump": "node scripts/dump-types.mjs"
+    "dump": "node scripts/dump-types.mjs",
+    "test": "node test/selftest.mjs && node test/plugin-selfcheck.mjs && node test/reload-safety.mjs",
+    "test:rules": "node test/selftest.mjs",
+    "test:plugin": "node test/plugin-selfcheck.mjs",
+    "test:reload": "node test/reload-safety.mjs"
   }
 }

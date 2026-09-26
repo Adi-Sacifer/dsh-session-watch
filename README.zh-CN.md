@@ -73,7 +73,17 @@ plugin_manager install_bundle  target: file:<本仓库>/plugin
 
 装好后它自己起定时器、每 15 秒扫一次，并把结果放在 `GET /session-watch/state`。界面半边（`plugin/client.js`）会在页面顶部弹一条提示，列出卡住的会话。
 
-**为什么宿主半边要自带一份判据**：插件会被装进 profile，而 workspace 路径可能被移动或缺失，所以它不能 `import` 这个仓库里的 `scan.mjs`。代价是判据存在两份——**所以两份都有测试钉着**（`test/selftest.mjs` 管工具那份，`test/plugin-selfcheck.mjs` 管插件那份）。不钉住的话其中一份会漂移，看门狗就会喊狼来了。
+**为什么宿主半边要自带一份判据**：插件会被装进 profile，而 workspace 路径可能被移动或缺失，所以它不能 `import` 这个仓库里的 `scan.mjs`。代价是判据存在两份——**所以两份都有测试钉着**（`test/selftest.mjs` 管工具那份，`test/plugin-selfcheck.mjs` 管插件那份，`test/reload-safety.mjs` 管可重载性）。不钉住的话其中一份会漂移，看门狗就会喊狼来了。
+
+#### 装插件的两个坑（都是实测撞出来的）
+
+**① 客户端半边在运行时装的包上不会出现。** `dsh.client` 的客户端模块要靠**启动时构建的模块图**，而它之后靠"按包注册的 HMR watch"保持新鲜。所以往运行中的宿主里装包，`/plugins/<id>/client.js` 会 **404**，直到重启。这就是为什么插件**自己** serve `notice.js` 并往 index.html 注入一行 `<script>`——这条路只需要刷新页面，不需要重启。
+
+**② 固定路由路径会让插件无法重载。** 重装时新实例注册同一路径会抛 `webserver: duplicate undefined route`，而这个错误**不只是让新实例激活失败**——它还把旧实例变成孤儿：旧实例还活着、还在服务，但已经脱离加载器控制，连 `set_plugin false` 都关不掉。结果是插件既坏了、又没法替换，除非重启。
+
+所以每条路由都带一个**从插件文件 mtime 推出来的加载戳**，而且**同一代只有一个主人**：重复 apply 发现戳已挂载就什么都不做（不重复注册路由、不叠第二个定时器、不往页面塞第二个提示）。`test/reload-safety.mjs` 的 13 条断言钉住这两点。
+
+**为什么"先查再注册"而不是"捕获异常"**：吞掉重复路由的报错会留下一个**半注册**的世代，而检查先行是干净的。这个取舍是刻意的。
 
 ### 模式1：按需看
 

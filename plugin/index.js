@@ -32,20 +32,30 @@ export const name = 'session-watch';
 export const inject = ['timer', 'webServer'];
 
 /*
- * ROUTES ARE PER-LOAD, NOT CONSTANTS - learned the hard way.
+ * RELOAD SAFETY - this plugin must survive being applied more than once in one process.
  *
- * With fixed paths, reinstalling a running Host's bundle threw
- *   webserver: duplicate undefined route "/session-watch/state"
- * which failed the new activation AND left the previous instance orphaned but still serving, so
- * the plugin ended up both broken and impossible to replace without a restart.
+ * Learned against the running Host, not in theory. With fixed web route paths, reinstalling the
+ * bundle tripped
+ *   webserver: duplicate undefined route
+ * which failed the new activation AND left the previous instance orphaned but still serving - the
+ * plugin ended up broken and impossible to replace without a restart.
  *
- * So every load derives its own stamp from its own file mtime. Each generation gets fresh paths,
- * a reload can never collide, and stale script URLs are cache-busted by the stamp.
+ * Two defences, and `test/reload-safety.mjs` holds both:
+ *
+ *   1. Every generation derives a stamp from its own file mtime, so its route paths differ from any
+ *      previous generation's. Two live copies cannot collide.
+ *   2. Each stamp has one owner. A second apply() of the SAME generation finds the stamp already
+ *      registered and does nothing at all - it does not register a second timer, a second set of
+ *      routes, or a second injection row. Checking first is what makes this safe rather than merely
+ *      lucky: swallowing a duplicate-route throw would leave a half-registered generation behind.
  */
 const LOAD_STAMP = (() => {
   try { return String(Math.floor(fs.statSync(new URL('./index.js', import.meta.url)).mtimeMs)); }
   catch { return String(Date.now()); }
 })();
+
+/** Stamps already mounted by this module instance. */
+const MOUNTED = new Set();
 
 const ROUTE = `/session-watch/state-${LOAD_STAMP}.json`;
 const NOTICE_ROUTE = `/session-watch/notice-${LOAD_STAMP}.js`;
@@ -146,6 +156,16 @@ function verdictOf(s, opts) {
 }
 
 export function apply(ctx, config) {
+  /*
+   * Already mounted by this module instance: do nothing. This is what keeps a re-apply from
+   * throwing on the routes, stacking a second timer, or adding a second notice script to the page.
+   */
+  if (MOUNTED.has(LOAD_STAMP)) {
+    ctx.logger?.info?.(`session-watch: generation ${LOAD_STAMP} already mounted, skipping re-apply`);
+    return;
+  }
+  MOUNTED.add(LOAD_STAMP);
+
   const intervalMs = Math.max(5, Number(config?.intervalSeconds ?? 15)) * 1000;
   const staleS = Math.max(30, Number(config?.staleSeconds ?? 300));
   const windowMin = Math.max(10, Number(config?.windowMinutes ?? 1440));
