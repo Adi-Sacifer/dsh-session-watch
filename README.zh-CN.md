@@ -79,7 +79,10 @@ node scripts/watch-sessions.mjs --interval 60 --stale 300
 plugin_manager install_bundle  target: file:<本仓库>/plugin
 ```
 
-装好后它自己起定时器、每 15 秒扫一次，并把结果放在 `GET /session-watch/state`。界面半边（`plugin/client.js`）会在页面顶部弹一条提示，列出卡住的会话。
+装好后它自己起定时器、每 15 秒扫一次，并把结果放在 `GET /session-watch/state-<载入戳>.json`（戳是插件文件自己的 mtime，见下面第 ② 条）。界面顶部那条提示由注入的 `notice.js` 画；`plugin/client.js` 只在注入那一半没跑起来时兜底，**它的状态地址也是从注入标签的 `data-session-watch-state` 上读的，不写死**。
+
+> ⚠️ **2026-09-27 修掉的一个真 bug（别再犯）**：`client.js` 原来写死了 `const ROUTE = '/session-watch/state'`，而**这个地址从来就不存在**（宿主注册的是带戳的那条）。于是它每 5 秒 404 一次，浏览器控制台滚出 1000 多条 `Failed to load resource ... 404`，用户报的就是"DevTools 一直在触发"；而它本该画的那条提示**一次都没出现过**。
+> 现在两条规矩：**① 地址只能从注入标签上读，不许写死；② 注入的那一半在跑时，这一半完全不动手**（两半画的是同一条提示，叠两条比不加载更糟）。`test/client-route-test.mjs` 把这两条都钉住了，改 `client.js` 之前先看它。
 
 **为什么宿主半边要自带一份判据**：插件会被装进 profile，而 workspace 路径可能被移动或缺失，所以它不能 `import` 这个仓库里的 `scan.mjs`。代价是判据存在两份——**所以两份都有测试钉着**（`test/selftest.mjs` 管工具那份，`test/plugin-selfcheck.mjs` 管插件那份，`test/reload-safety.mjs` 管可重载性）。不钉住的话其中一份会漂移，看门狗就会喊狼来了。
 
@@ -319,3 +322,11 @@ node scripts/dump-types.mjs <会话文件>
 ## 授权
 
 MIT，见 [LICENSE](LICENSE)。
+
+### 本次连接与重载修复（2026-09-27）
+
+状态请求增加 10 秒超时、失败退避和防重叠；断线时提示监视服务暂不可用，恢复后自动清除。插件卸载或加载失败时释放路由和挂载标记，支持同一宿主内再次启用。
+
+针对 DSH Desktop 0.1.7-rc.2 的插件热更新通道，向已有的 `/plugins/events` 连接每 30 秒发送一条 SSE 注释保活，避免空闲连接超时；不改变热更新消息，卸载时恢复原处理器。宿主不存在此接口时不启用兼容处理。
+
+更新后需要重启 DSH，让宿主加载新模块。安装目录可能是独立副本，不能假定与源码硬链接；应运行 `test/verify-installed.mjs` 检查实际安装内容。

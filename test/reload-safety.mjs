@@ -37,6 +37,7 @@ const check = (label, actual, expected) => {
 function makeHost() {
   const exact = new Map();
   const prefixes = new Map();
+  const disposeHandlers = [];
   const state = { registered: [], intervals: 0, injectListeners: 0, throwCount: 0 };
   const ctx = {
     interval: () => { state.intervals++; return () => { }; },
@@ -50,10 +51,10 @@ function makeHost() {
       },
     },
     emit: () => { },
-    on: (name) => { if (name === 'webserver/index-inject') state.injectListeners++; return () => { }; },
+    on: (name, fn) => { if (name === 'dispose') disposeHandlers.push(fn); if (name === 'webserver/index-inject') state.injectListeners++; return () => { }; },
     logger: { info: () => { }, warn: () => { } },
   };
-  return { ctx, state };
+  return { ctx, state, exact, prefixes, dispose: () => disposeHandlers.splice(0).forEach(fn => fn()) };
 }
 
 /* 1. the first apply registers both routes and starts one timer */
@@ -105,6 +106,29 @@ check('every route path carries a load stamp',
 const stamps = new Set(routes.map((r) => (r.match(/-(\d+)\.(json|js)$/) || [])[1]));
 check('all three routes agree on ONE stamp', stamps.size, 1);
 check('the stamp is numeric', /^\d+$/.test([...stamps][0] ?? ''), true);
+
+// Disposal must release registrations and allow the SAME imported module to reactivate.
+check('routes use the exact-path API', host.exact.size, 3);
+host.dispose();
+check('disposal removes all routes', host.exact.size + host.prefixes.size, 0);
+plugin.apply(host.ctx, { intervalSeconds: 15 });
+check('re-enable mounts routes again', host.exact.size, 3);
+check('re-enable starts a new timer', host.state.intervals, 2);
+const independent = makeHost();
+plugin.apply(independent.ctx, {});
+check('another host is not suppressed by a module-global stamp', independent.exact.size, 3);
+const broken = makeHost();
+const originalRegister = broken.ctx.webServer.register;
+let attempts = 0;
+broken.ctx.webServer.register = route => {
+  if (++attempts === 2) throw Error('simulated registration failure');
+  return originalRegister(route);
+};
+try { plugin.apply(broken.ctx, {}); } catch {}
+check('failed activation rolls back routes', broken.exact.size, 0);
+broken.ctx.webServer.register = originalRegister;
+plugin.apply(broken.ctx, {});
+check('failed activation can be retried', broken.exact.size, 3);
 
 console.log(`sandbox: ${ROOT}`);
 console.log(`${pass} assertion(s) passed`);

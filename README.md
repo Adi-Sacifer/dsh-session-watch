@@ -218,3 +218,11 @@ on Windows.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+### Connection and reload fixes (2026-09-27)
+
+- Poll only the state URL supplied by the injected script. Failed requests back off from 10 seconds to 5 minutes; requests time out after 10 seconds and cannot overlap. The injected notice displays a connection warning and clears it on recovery.
+- Release registered routes and mount ownership when the plugin is disposed or activation fails, so disabling and re-enabling works in the same host process.
+- On hosts exposing `/plugins/events`, add an SSE comment every 30 seconds to keep the desktop fetch bridge active during idle periods. Graph and rebuilt messages remain unchanged. Disposing the plugin restores the original handler. This compatibility fix targets the bundled HMR transport in DSH Desktop 0.1.7-rc.2; it does nothing if that route is absent.
+
+After updating an already loaded host plugin, restart DSH to replace its cached module. Verify the installed files separately: package-manager installations can be copies rather than hardlinks. Regression checks include `test/notice-poll.mjs`, `test/event-keepalive.mjs`, and `test/reload-safety.mjs`.

@@ -35,7 +35,7 @@ const check = (label, actual, expected) => {
 };
 
 /* every file index.js depends on must be present in the installed copy */
-for (const dep of ['index.js', 'notice.js', 'diagnose.js', 'archive.js']) {
+for (const dep of ['index.js', 'notice.js', 'diagnose.js', 'archive.js', 'event-keepalive.js']) {
   check(`installed copy ships ${dep}`, fs.existsSync(path.join(dir, dep)), true);
 }
 

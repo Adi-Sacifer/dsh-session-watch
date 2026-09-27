@@ -29,6 +29,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readRecords, hasZstd, unavailableReason } from './archive.js';
 import { diagnose } from './diagnose.js';
+import { keepPluginEventsAlive } from './event-keepalive.js';
 
 export const name = 'session-watch';
 
@@ -61,8 +62,8 @@ const LOAD_STAMP = (() => {
   catch { return String(Date.now()); }
 })();
 
-/** Stamps already mounted by this module instance. */
-const MOUNTED = new Set();
+/** One owner per host; disposal or failed activation releases ownership. */
+const MOUNTED = new WeakMap();
 
 const ROUTE = `/session-watch/state-${LOAD_STAMP}.json`;
 const NOTICE_ROUTE = `/session-watch/notice-${LOAD_STAMP}.js`;
@@ -192,11 +193,23 @@ export function apply(ctx, config) {
    * Already mounted by this module instance: do nothing. This is what keeps a re-apply from
    * throwing on the routes, stacking a second timer, or adding a second notice script to the page.
    */
-  if (MOUNTED.has(LOAD_STAMP)) {
+  const server = ctx.webServer;
+  if (MOUNTED.has(server)) {
     ctx.logger?.info?.(`session-watch: generation ${LOAD_STAMP} already mounted, skipping re-apply`);
     return;
   }
-  MOUNTED.add(LOAD_STAMP);
+  const routes = [];
+  const owner = {};
+  MOUNTED.set(server, owner);
+  const cleanup = () => {
+    for (const dispose of routes.splice(0).reverse()) dispose();
+    if (MOUNTED.get(server) === owner) MOUNTED.delete(server);
+  };
+  if (typeof ctx.effect === 'function') ctx.effect(() => cleanup);
+  else ctx.on('dispose', cleanup);
+  const register = (route) => routes.push(server.register({ kind: 'exact', ...route }));
+  try {
+  routes.push(keepPluginEventsAlive(ctx));
 
   const intervalMs = Math.max(5, Number(config?.intervalSeconds ?? 15)) * 1000;
   const staleS = Math.max(30, Number(config?.staleSeconds ?? 300));
@@ -750,7 +763,7 @@ export function apply(ctx, config) {
     });
   }
 
-  ctx.webServer.register({
+  register({
     method: 'GET',
     path: ROUTE,
     handler: (req, res) => {
@@ -771,7 +784,7 @@ export function apply(ctx, config) {
    * becomes the notification target. Self-selecting this way means the person looking at the GUI is
    * the person who gets told, without any configuration.
    */
-  ctx.webServer.register({
+  register({
     method: 'POST',
     path: WATCHER_ROUTE,
     handler: (req, res) => {
@@ -816,7 +829,7 @@ export function apply(ctx, config) {
   }
 
   if (noticeSource !== null) {
-    ctx.webServer.register({
+    register({
       method: 'GET',
       path: NOTICE_ROUTE,
       handler: (req, res) => {
@@ -835,4 +848,8 @@ export function apply(ctx, config) {
   }
 
   ctx.logger?.info?.(`session-watch ready: every ${intervalMs / 1000}s, stuck after ${staleS}s of silence, zstd=${hasZstd ? 'yes' : 'NO'}`);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }

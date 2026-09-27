@@ -21,6 +21,19 @@
  *   control and no client-plugin HMR watcher on this machine. What CAN be verified is that the
  *   host half serves the state (curl the route) and that this file is served to the page
  *   (fetch /plugins/<id>/client.js). Visual confirmation is the user's eye, or a refresh.
+ *
+ * THE 404s THIS FILE USED TO CAUSE - worth reading before touching it again
+ *   It hard-coded the state route as `/session-watch/state`. That path has NEVER existed: the host
+ *   registers `/session-watch/state-<load-stamp>.json`, stamped so that reinstalling the plugin
+ *   cannot collide with the previous generation's routes. So every 5s this poll 404'd, and the
+ *   page's console accumulated >1000 errors - the user's report was literally "DevTools 一直在触发".
+ *   The notice it was supposed to draw never appeared either.
+ *
+ *   Two rules now, and both matter:
+ *     1. The URL is read off the injected <script> tag (see `stateUrl()`), never hard-coded.
+ *     2. If the injected notice is already running, this half stays completely out of the way.
+ *        Both halves draw the same notice, and stacking two copies of it is worse than not
+ *        loading at all. No URL and no fetch: silence beats shouting.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-session-watch',
@@ -28,7 +41,25 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
-    const ROUTE = '/session-watch/state';
+    /**
+     * The route is unique per plugin load, and the host publishes it on the tag it injects into the
+     * served index.html. Reading it from there is the only way to stay correct across reloads.
+     */
+    function stateUrl() {
+      const tag = document.getElementById('session-watch-notice-loader');
+      const url = tag && tag.getAttribute('data-session-watch-state');
+      return url || null;
+    }
+
+    /**
+     * Has the injected notice taken over?
+     *
+     * `notice.js` sets the window flag when it starts; the element check covers the ordering where
+     * this module mounts first and the injected script draws one tick later. Either way, one notice.
+     */
+    function injectedNoticeOwnsUi() {
+      return Boolean(window.__sessionWatchNotice) || Boolean(document.getElementById('session-watch-notice'));
+    }
 
     const styles = {
       wrap: {
@@ -78,17 +109,38 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         let alive = true;
+        let inFlight = false;
+        let failures = 0;
+        let nextReadAt = 0;
         const read = async () => {
+          /* the injected notice is already drawing it: this half must not fetch, must not render */
+          if (!alive || inFlight || Date.now() < nextReadAt || injectedNoticeOwnsUi()) return;
+          const url = stateUrl();
+          /*
+           * No tag means the index-injection did not happen, so there is no route to read and
+           * nothing to draw from here. Returning is the whole point: the previous version fetched a
+           * hard-coded path here and filled the console with 404s.
+           */
+          if (!url) return;
+          inFlight = true;
           try {
-            const res = await fetch(ROUTE, { headers: { accept: 'application/json' } });
-            if (res.ok && alive) setState(await res.json());
-          } catch { /* host not ready or route gone: stay silent rather than shout */ }
+            const res = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { accept: 'application/json' } });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const state = await res.json();
+            failures = 0;
+            nextReadAt = 0;
+            if (alive) setState(state);
+          } catch {
+            failures++;
+            nextReadAt = Date.now() + Math.min(300000, 5000 * Math.pow(2, Math.min(failures, 6)));
+          } finally { inFlight = false; }
         };
         read();
         const timer = setInterval(read, 5000);
         return () => { alive = false; clearInterval(timer); };
       }, []);
 
+      if (injectedNoticeOwnsUi()) return null;
       if (hidden || !state || !state.stuck || state.stuck.length === 0) return null;
 
       const count = state.stuck.length;

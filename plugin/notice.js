@@ -22,8 +22,8 @@
    * `document.currentScript` is only valid while the tag executes, so capture it first.
    */
   var HERE = document.currentScript;
-  var STATE_URL = (HERE && HERE.getAttribute('data-session-watch-state')) || '/session-watch/state.json';
-  var WATCHER_URL = (HERE && HERE.getAttribute('data-session-watch-watcher')) || '/session-watch/watcher.json';
+  var STATE_URL = (HERE && HERE.getAttribute('data-session-watch-state')) || null;
+  var WATCHER_URL = (HERE && HERE.getAttribute('data-session-watch-watcher')) || null;
   var POLL_MS = 5000;
   var ID = 'session-watch-notice';
 
@@ -183,11 +183,21 @@
     el.appendChild(close);
   }
 
+  var inFlight = false;
+  var failures = 0;
+  var nextReadAt = 0;
   function read() {
-    fetch(STATE_URL, { headers: { accept: 'application/json' } })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (state) { if (state) render(state); })
-      .catch(function () { /* host not ready: say nothing rather than shout */ });
+    if (!STATE_URL || inFlight || Date.now() < nextReadAt) return;
+    inFlight = true;
+    fetch(STATE_URL, { signal: AbortSignal.timeout(10000), headers: { accept: 'application/json' } })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (state) { failures = 0; nextReadAt = 0; render(state); })
+      .catch(function () {
+        failures++;
+        nextReadAt = Date.now() + Math.min(300000, POLL_MS * Math.pow(2, Math.min(failures, 6)));
+        renderUnavailable({ reason: '暂时无法连接会话监视服务，正在自动重试' });
+      })
+      .finally(function () { inFlight = false; });
   }
 
   /*
@@ -198,6 +208,7 @@
    * conversations. It is best-effort on purpose: a failure here must not break the notice.
    */
   function identify() {
+    if (!WATCHER_URL) return;
     var payload = { sessionId: null, href: String(location.href || '') };
     try {
       var m = /(?:session|s)=([0-9a-f-]{8,})/i.exec(payload.href);
@@ -213,7 +224,7 @@
   }
 
   function start() {
-    if (window.__sessionWatchNotice) return;
+    if (!STATE_URL || window.__sessionWatchNotice) return;
     window.__sessionWatchNotice = true;
     identify();
     read();
