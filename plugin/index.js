@@ -66,6 +66,27 @@ const ROUTE = `/session-watch/state-${LOAD_STAMP}.json`;
 const NOTICE_ROUTE = `/session-watch/notice-${LOAD_STAMP}.js`;
 const WATCHER_ROUTE = `/session-watch/watcher-${LOAD_STAMP}.json`;
 
+export function makeNoticeInjection(noticeRoute, stateRoute, watcherRoute) {
+  /* The notice runs after parsing, so it cannot disturb the shell's startup document. */
+  const script = `(() => {
+    const load = () => {
+      if (document.getElementById('session-watch-notice-loader')) return;
+      const el = document.createElement('script');
+      el.id = 'session-watch-notice-loader';
+      el.src = ${JSON.stringify(noticeRoute)};
+      el.setAttribute('data-session-watch-state', ${JSON.stringify(stateRoute)});
+      el.setAttribute('data-session-watch-watcher', ${JSON.stringify(watcherRoute)});
+      document.body.appendChild(el);
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', load, { once: true });
+    } else {
+      load();
+    }
+  })()`;
+  return { kind: 'script', placement: 'body', text: script };
+}
+
 const DSH = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const SESS_ROOT = path.join(DSH, 'sessions');
 const PROJ_CACHE = path.join(DSH, 'storages', 'session_projcache', 'sessions');
@@ -480,10 +501,7 @@ export function apply(ctx, config) {
     });
 
     ctx.on('webserver/index-inject', (table) => {
-      /* the state URL and the watcher URL travel on the script tag, so the notice never guesses a
-       * path that a reload would stale */
-      const tag = `<script src="${NOTICE_ROUTE}" data-session-watch-state="${ROUTE}" data-session-watch-watcher="${WATCHER_ROUTE}" defer></script>`;
-      table.push({ kind: 'script', placement: 'body', text: `document.write(${JSON.stringify(tag)})` });
+      table.push(makeNoticeInjection(NOTICE_ROUTE, ROUTE, WATCHER_ROUTE));
     });
   }
 

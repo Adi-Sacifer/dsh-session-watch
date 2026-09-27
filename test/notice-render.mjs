@@ -29,6 +29,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { makeNoticeInjection } from '../plugin/index.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const NOTICE = path.join(here, '..', 'plugin', 'notice.js');
@@ -85,11 +86,18 @@ let CURRENT = idle;
 
 const noticeSource = fs.readFileSync(NOTICE, 'utf8');
 const scriptTag = (statePath) => `<script src="/plugin/notice.js" data-session-watch-state="${statePath}" defer></script>`;
+const injectedScript = makeNoticeInjection('/plugin/notice.js', '/live/state.json', '/live/watcher.json').text;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (url.pathname === '/page.html') {
     const body = `<!doctype html><html><head><meta charset="utf-8"><title>notice test</title></head><body>${scriptTag('/live/state.json')}</body></html>`;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+  if (url.pathname === '/injected.html') {
+    const body = `<!doctype html><html><head><meta charset="utf-8"><title>injected notice test</title></head><body><main id="shell-marker">shell intact</main><script>${injectedScript}</script></body></html>`;
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(body);
     return;
@@ -239,6 +247,15 @@ async function main() {
   await sleep(200);
   const r6 = await readNotice();
   check('dismissal: element removed after clicking close', r6.present, false);
+
+  /* The actual index-injection code must load the notice without rewriting the shell. */
+  CURRENT = oneStuck;
+  await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/injected.html` });
+  await sleep(900);
+  const injected = await readNotice();
+  check('injected: notice renders', injected.present, true);
+  check('injected: shell content remains', await evaluate(`document.getElementById('shell-marker')?.textContent`), 'shell intact');
+  check('injected: script loader exists', await evaluate(`Boolean(document.getElementById('session-watch-notice-loader'))`), true);
 
   ws.close();
 }

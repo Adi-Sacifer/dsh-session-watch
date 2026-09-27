@@ -204,6 +204,7 @@ check('the row carries executable text', typeof injectionTable[0]?.text === 'str
 const injected = String(injectionTable[0]?.text);
 check('the injected row points at the stamped notice route', injected.includes(noticeKey), true);
 check('the injected row hands over the stamped state route', injected.includes(stateKey), true);
+check('the injected row does not rewrite the document', injected.includes('document.write'), false);
 /* the filename and the stamped path must agree, or the page loads a 404 */
 check('notice fetch path matches the registered route', noticeKey.startsWith('/session-watch/notice-'), true);
 check('state path matches the registered route', stateKey.startsWith('/session-watch/state-'), true);
