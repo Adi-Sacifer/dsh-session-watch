@@ -6,6 +6,7 @@
 
 ```
 scripts/probe-sessions.mjs   看看有没有会话卡住      ~7 KB
+scripts/pending.mjs          它到底在等什么          ~6 KB
 scripts/peek-text.mjs        看看那个会话在说什么    ~5 KB
 scripts/dump-types.mjs       宿主格式变了就重新校准   ~3 KB
 ```
@@ -114,7 +115,7 @@ Windows 上双击就行：`check-sessions.cmd`
 ```
 === cross-session stuck check   22:08:38
     window: touched within 120 min   |   sessions on disk: 25
-    rule: silent > 180s with an unmatched tool/call  =>  stuck
+    rule: silent > 300s with an unmatched tool/call  =>  stuck
 
 -- working -------------------------------------
 * session-dbeaf1b0-...   检查会话卡住功能询问
@@ -127,6 +128,45 @@ Windows 上双击就行：`check-sessions.cmd`
 >>> all clear: no session is parked on an unmatched tool call.
     Checked 5 session(s) touched in the last 120 min.
 ```
+
+### 判它"卡住"之后，先别急着救：它在等什么？
+
+`probe-sessions` 回答"要不要担心"，回答不了"为什么"。而这两件事**从外面看一模一样**：
+
+| 转录尾部 | 它到底怎么了 |
+|---|---|
+| 有没配对的 `tool/call` | **可能是真的挂了**，也可能只是那个命令自己允许跑 15 分钟 |
+| 回合开着、没有工具调用 | 在等模型（思考或流式输出），慢和挂当时长得一样 |
+
+所以有 `scripts/pending.mjs`：它把**唯一能区分这两件事的信息**打出来——那个没回来的调用的**参数**。一条自带 `timeoutMs: 900000` 的命令，自己就把问题回答了。
+
+```powershell
+node scripts/pending.mjs 7e241cab b0325d55
+```
+
+实测输出：
+
+```
+--- 继续做 ai-lover 界面精简 ---
+  session-7e241cab-813d-4c33-a619-d6e21cef1c32
+  quiet 142s   last write 23:04:28   records 2901
+  >>> WAITING ON A TOOL: pwsh  (started 142s ago)
+      { "command": "node tools/cdp-group.mjs ...", "timeoutMs": 900000 }
+      -> that call allowed itself 900s; it has used 142s
+      -> STILL WITHIN ITS OWN BUDGET: this is patience, not a hang
+
+--- DSH 后台任务完成提示图标设计 ---
+  session-b0325d55-...
+  quiet 248s   last write 23:02:41   records 2671
+  >>> nothing pending: the turn closed on turn/end. This session is idle, not stuck.
+```
+
+**这一条是实测撞出来的**：第一版默认阈值是 180 秒，它把一个正在跑自己测试套件的健康会话报成了"卡住"——而那个 `pwsh` 调用自己给的超时是 900 秒。所以现在：
+
+- 默认阈值调到 **300 秒**（和宿主插件一致）
+- 更要紧的是：**"工具调用没回来"和"回合开着但没工具调用"分成两种证据**（`scan.mjs` 的 `OPEN_TURN_STALE_FACTOR = 4`），后者要 4 倍静默才算数。这跟插件那份判据现在是同一个**规则**（数字不必相同，**区分必须相同**）
+
+`pending.mjs` 只读**结构**加那个挂起调用自己的参数（命令行、文件路径），**不读回复正文**——读正文是 `peek-text.mjs` 的事，那个需要你明确开口。
 
 看别的会话**在说什么**（它自己的进展汇报）：
 

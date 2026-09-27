@@ -90,7 +90,7 @@ export function tail(records) {
   for (const r of records) {
     if (!r || !r.type) continue;
     if (r.time) lastAt = r.time;
-    if (r.type === 'tool/call') openTool = { name: r.data?.name || '?', callId: r.data?.callId, at: r.time || 0 };
+    if (r.type === 'tool/call') openTool = { name: r.data?.name || '?', callId: r.data?.callId, at: r.time || 0, args: r.data?.arguments };
     else if (r.type === 'tool/result') {
       const id = r.data?.callId ?? r.data?.message?.toolCallId;
       results.add(id);
@@ -103,16 +103,29 @@ export function tail(records) {
 }
 
 /*
+ * An open turn is NOT an open tool call, and treating them as the same evidence is the false alarm
+ * that made two healthy conversations report each other as stuck. An unmatched `tool/call` means a
+ * tool was invoked and never came back - at `stale` that is strong evidence. An open turn with NO
+ * tool call is only "the model was asked something", and a model that is still streaming writes
+ * nothing to the transcript either, so silence there is what hard work looks like.
+ *
+ * Measured against a real case: a session running its own end-to-end suite issued one `pwsh` call
+ * with a 900s timeout and sat silent for 200s+. Reported as stuck at 180s - a false alarm, and the
+ * same shape of false alarm the plugin had.
+ *
+ * This is the CLI half of a rule the host plugin applies at 4x (see plugin/index.js
+ * OPEN_TURN_STALE_FACTOR). Keep the two in step: the numbers need not be identical, the DISTINCTION
+ * must be.
+ */
+export const OPEN_TURN_STALE_FACTOR = 4;
+
+/*
  * One session -> one verdict.
  *   'mine'     the caller's own session; it is always writing as it goes, so never a problem
  *   'stuck'    stopped writing while a call or turn is still open
  *   'working'  open work AND still writing
  *   'idle'     turn closed cleanly; this is the normal resting state
  *   'unreadable' the file exists but could not be parsed
- *
- * `stale` matters for BOTH open states: an open tool call and an open turn (waiting on the
- * model) are indistinguishable from a hang by transcript shape alone, so silence is what
- * separates them. A session genuinely mid-request keeps flushing.
  */
 export function verdictOf(session, opts = {}) {
   const staleS = opts.staleS ?? 180;
@@ -129,10 +142,11 @@ export function verdictOf(session, opts = {}) {
 
   const open = Boolean(t.openTool || t.openTurn);
   const kind = t.openTool ? `tool/call(${t.openTool.name})` : t.openTurn ? 'open turn (waiting on model)' : `closed(${t.lastType})`;
+  const waitS = t.openTool ? staleS : staleS * OPEN_TURN_STALE_FACTOR;
 
   let state;
   if (session.id === me) state = 'mine';
-  else if (open && quietS > staleS) state = 'stuck';
+  else if (open && quietS > waitS) state = 'stuck';
   else if (open) state = 'working';
   else state = 'idle';
 

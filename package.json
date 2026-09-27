@@ -21,6 +21,7 @@
     "check": "node scripts/probe-sessions.mjs",
     "watch": "node scripts/watch-sessions.mjs",
     "peek": "node scripts/peek-text.mjs",
+    "pending": "node scripts/pending.mjs",
     "dump": "node scripts/dump-types.mjs",
     "test": "node test/selftest.mjs && node test/plugin-selfcheck.mjs && node test/reload-safety.mjs && node test/notice-render.mjs && node test/notice-poll.mjs && node test/event-keepalive.mjs && node test/client-route-test.mjs && node test/diagnose-test.mjs && node test/notify-test.mjs && node test/mutual-watch-test.mjs && node test/verify-installed.mjs",
     "test:rules": "node test/selftest.mjs",

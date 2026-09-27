@@ -34,14 +34,16 @@
  *
  * This is a SNAPSHOT, not a daemon - it looks once and exits. For a loop, use watch-sessions.mjs.
  *
- * Usage: node probe-sessions.mjs [--minutes 90] [--stale 180] [--json]
+ * Usage: node probe-sessions.mjs [--minutes 90] [--stale 300] [--json]
  */
 import { scan } from './lib/scan.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf(`--${n}`); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
 const WINDOW_MIN = Number(arg('minutes', 90));
-const STALE_S = Number(arg('stale', 180));
+/* 300s, the same default the host plugin ships with. The old 180 was measured crying wolf on a
+ * session that was simply running its own test suite. */
+const STALE_S = Number(arg('stale', 300));
 const AS_JSON = argv.includes('--json');
 
 const r = scan({ minutes: WINDOW_MIN, staleS: STALE_S });
