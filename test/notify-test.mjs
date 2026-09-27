@@ -87,7 +87,17 @@ function makeHost({ roots = [], withAgents = true } = {}) {
 
 /* 1. a stuck session produces one message, naming the cause and the command */
 {
-  const host = makeHost({ roots: ['watcher-1', 'watcher-2'] });
+  /*
+   * The roots must include at least one conversation that is NOT the victim.
+   *
+   * This fixture used to list only 'watcher-1'/'watcher-2' while the victim itself was also a root,
+   * which quietly relied on the old code being willing to deliver to anyone who was not the victim -
+   * including into a conversation in the middle of a turn. The plugin now refuses to report a session
+   * to a recipient that is mid-turn (that interruption is half of the mutual-watch loop), so the
+   * fixture has to model what the real GUI has: a watcher conversation that is sitting idle while the
+   * other one hangs.
+   */
+  const host = makeHost({ roots: ['sess-observer', 'watcher-1', 'watcher-2'] });
   const plugin = await freshPlugin();
   plugin.apply(host.ctx, { intervalSeconds: 15, staleSeconds: 300, windowMinutes: 1440 });
   host.state.tick();
@@ -116,9 +126,9 @@ function makeHost({ roots = [], withAgents = true } = {}) {
   check('it discloses what was read', /读了什么/.test(text), true);
   check('it offers next actions', /要我/.test(text), true);
 
-  /* both roots hear about it, and neither is the victim */
+  /* every root that can be told hears about it, and the victim is never told about itself */
   const targets = host.state.delivered.map((d) => d.to);
-  check('every root conversation is told', targets.sort().join(','), 'watcher-1,watcher-2');
+  check('every idle root conversation is told', targets.sort().join(','), 'sess-observer,watcher-1,watcher-2');
   check('the stuck session is never told about itself', targets.includes('sess-victim'), false);
 
   /* the same diagnosis must also be visible in the state the UI polls */
@@ -133,13 +143,30 @@ function makeHost({ roots = [], withAgents = true } = {}) {
 
 /* 2. it must not repeat itself every tick */
 {
-  const host = makeHost({ roots: ['watcher-1'] });
+  /* same reason as section 1: the recipient must be a conversation that is not the victim, or there
+   * is nobody eligible and "reported once" would be satisfied by reporting zero times */
+  const host = makeHost({ roots: ['sess-observer', 'watcher-1'] });
   const plugin = await freshPlugin();
   plugin.apply(host.ctx, { intervalSeconds: 15, staleSeconds: 300, windowMinutes: 1440 });
   host.state.tick();
   host.state.tick();
   host.state.tick();
-  check('reported once per cause, not per tick', host.state.delivered.length, 1);
+
+  /*
+   * One message per RECIPIENT, not one message total.
+   *
+   * The contract is "this conversation has been told about this session, so do not tell it again".
+   * Repeating a tick must not produce a second message for anybody - that is the actual regression
+   * this section guards - and a recipient that was skipped while it was mid-turn is still allowed its
+   * one message when it becomes free. Asserting a flat total of 1 would forbid that legitimate,
+   * necessary delivery and would have made the "do not drop the alert" path untestable.
+   */
+  const perTarget = {};
+  for (const d of host.state.delivered) perTarget[d.to] = (perTarget[d.to] ?? 0) + 1;
+  check('reported once per cause, not per tick',
+    Object.values(perTarget).every((n) => n === 1), true);
+  check('the idle observer was told', perTarget['sess-observer'], 1);
+  check('and was not told again on the next two ticks', perTarget['watcher-1'], 1);
 }
 
 /* 3. diagnosis can be turned off, and then no message is sent */
@@ -170,12 +197,25 @@ function makeHost({ roots = [], withAgents = true } = {}) {
     host.state.tick();
   } catch (error) { threw = String(error?.message ?? error); }
   check('works without ctx.agents', threw, null);
-  check('and logs no warning', host.state.logged.some((l) => l.startsWith('WARN')), false);
+  /*
+   * ...and SAYS SO. Silence is the failure mode this repo exists to prevent: a watchdog that cannot
+   * reach any conversation is indistinguishable from one with nothing to report, so the inability to
+   * deliver is logged (once) and also carried in the snapshot the page polls.
+   */
+  check('...and says so, once, in the log',
+    host.state.logged.filter((l) => l.startsWith('WARN') && /unavailable/.test(l)).length, 1);
+
+  const stateRoute = Object.keys(host.state.routes).find((k) => /^GET \/session-watch\/state-.*\.json$/.test(k));
+  let servedNoAgents = null;
+  host.state.routes[stateRoute].handler({}, { writeHead: () => { }, end: (b) => { servedNoAgents = JSON.parse(b); } });
+  check('...and carries the same fact in the snapshot',
+    typeof servedNoAgents?.notifyUnavailable === 'string' && servedNoAgents.notifyUnavailable.length > 0, true);
 }
 
 /* 6. contentBudget 0 keeps the diagnosis structure-only, even though notification still happens */
 {
-  const host = makeHost({ roots: ['watcher-1'] });
+  /* the recipient has to be a conversation other than the victim - see section 1 */
+  const host = makeHost({ roots: ['sess-observer'] });
   const plugin = await freshPlugin();
   plugin.apply(host.ctx, { intervalSeconds: 15, staleSeconds: 300, windowMinutes: 1440, diagnosisMessages: 0 });
   host.state.tick();
@@ -187,7 +227,7 @@ function makeHost({ roots = [], withAgents = true } = {}) {
 
 /* 7. an explicitly pinned target is used instead of every root */
 {
-  const host = makeHost({ roots: ['watcher-1', 'watcher-2'] });
+  const host = makeHost({ roots: ['sess-observer', 'watcher-1', 'watcher-2'] });
   const plugin = await freshPlugin();
   plugin.apply(host.ctx, { intervalSeconds: 15, staleSeconds: 300, windowMinutes: 1440, notifySessionId: 'watcher-2' });
   host.state.tick();
@@ -196,7 +236,7 @@ function makeHost({ roots = [], withAgents = true } = {}) {
 
 /* 8. a pinned target that wants tuning must not silently report itself */
 {
-  const host = makeHost({ roots: ['watcher-1'] });
+  const host = makeHost({ roots: ['sess-victim', 'sess-observer'] });
   const plugin = await freshPlugin();
   plugin.apply(host.ctx, { intervalSeconds: 15, staleSeconds: 300, windowMinutes: 1440, notifySessionId: 'sess-victim' });
   host.state.tick();

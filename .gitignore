@@ -2,6 +2,7 @@
 *.log
 *.tmp
 node_modules/
+sw-suite.txt
 
 # Windows
 Thumbs.db

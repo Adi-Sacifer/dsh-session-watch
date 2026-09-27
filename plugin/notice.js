@@ -159,8 +159,18 @@
     var readNote = stuck[0] && stuck[0].read && stuck[0].read.length
       ? '已读取：' + stuck[0].read.join('、')
       : '只看了结构信息';
-    why.textContent = '判据：转录停止增长超过 ' + (state.staleSeconds || '?') + 's 且回合未收尾　·　'
-      + readNote + '　·　只读，没有动它';
+    /*
+     * The rule comes from the host, not from a string baked in here. The host now applies two
+     * different windows - a tool call that never returned is evidence, an open turn with no tool
+     * call is merely "the model may still be thinking" - and a page that printed one old number for
+     * both would be lying about the weaker row.
+     */
+    var strong = (state.staleSeconds || '?') + 's';
+    var weak = (state.weakStaleSeconds || state.staleSeconds || '?') + 's';
+    var rule = stuck[0] && stuck[0].signal === 'open-turn'
+      ? '回合开着但没有工具调用，且转录静默超过 ' + weak
+      : '转录停止增长超过 ' + strong + ' 且工具调用没回来';
+    why.textContent = '判据：' + rule + '　·　' + readNote + '　·　只读，没有动它';
     box.appendChild(why);
 
     el.appendChild(box);

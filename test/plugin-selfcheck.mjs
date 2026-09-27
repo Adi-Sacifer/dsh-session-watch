@@ -92,7 +92,18 @@ const noticeKey = Object.keys(registered).find((k) => /^\/session-watch\/notice-
 check('registered a state route', typeof stateKey, 'string');
 check('state route is a GET', stateKey && registered[stateKey].method, 'GET');
 check('registered an interval', intervalConfig?.ms, 15_000);
-check('no error log during apply', logs.some((l) => l.startsWith('WARN')), false);
+/*
+ * This fake ctx has NO `agents` member - which the plugin now REPORTS instead of silently tolerating.
+ * A watchdog that cannot deliver a diagnosis to anybody is indistinguishable from one with nothing to
+ * say, so the warning is issued once at apply() and the same fact travels in the snapshot. The
+ * assertion is therefore "it said so, exactly once", not "it stayed quiet".
+ *
+ * (Nothing else in apply() may warn; a warning here is how a broken activation would show up.)
+ */
+check('warns exactly once that it cannot deliver a diagnosis',
+  logs.filter((l) => l.startsWith('WARN') && /ctx\.agents is unavailable/.test(l)).length, 1);
+check('and no other warning during apply',
+  logs.filter((l) => l.startsWith('WARN')).length, 1);
 
 /* 2. the route must answer with the snapshot shape the UI consumes */
 let served = null;

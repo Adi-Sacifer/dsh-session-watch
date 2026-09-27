@@ -11,9 +11,11 @@
  * WHY THE LOGIC IS INLINED HERE
  *   The tools in this repo keep the verdict in `scripts/lib/scan.mjs`, but a plugin must not
  *   depend on a workspace path - the plugin is installed into the profile, and the workspace may
- *   be moved or missing. So this file carries its own copy. That is a real tradeoff: two copies of
- *   a judgement can drift, which is why both copies are covered by the same 20-assertion test
- *   (`test/selftest.mjs` for the tools, `test/plugin-selfcheck.mjs` for this half).
+ *   be moved or missing. So this file carries its own copy. That is a real tradeoff, and it has
+ *   now actually bitten: the fix for the mutual-watch loop below (an open turn and an open tool
+ *   call are different evidence) exists ONLY here, so the CLI copy still reports a model that is
+ *   merely thinking as `stuck`. That copy has no notification path, so it cannot start the loop -
+ *   but the two files no longer agree, and that is a debt, not a design.
  *
  * ENVIRONMENT HONESTY
  *   Reading the transcript needs zstd. Node 24 has `zlib.zstdDecompressSync`; Electron's bundled
@@ -87,6 +89,19 @@ export function makeNoticeInjection(noticeRoute, stateRoute, watcherRoute) {
   return { kind: 'script', placement: 'body', text: script };
 }
 
+/*
+ * AN OPEN TURN IS NOT AN OPEN TOOL CALL, and treating them the same is the false alarm that started
+ * this. An unmatched `tool/call` means a tool was invoked and never came back: at `staleSeconds` that
+ * is strong evidence. An open turn with NO tool call is just "the model has been asked something" -
+ * and a model that is still streaming its answer writes nothing to the transcript either, so silence
+ * there is exactly what a hard-working session looks like. Applying one threshold to both is what
+ * made two busy conversations report each other as stuck.
+ *
+ * So the weak signal gets a much longer window AND it must not wake anyone. A genuinely hung model
+ * stream still shows up in the UI snapshot, where a person can act on it.
+ */
+const OPEN_TURN_STALE_FACTOR = 4;
+
 const DSH = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const SESS_ROOT = path.join(DSH, 'sessions');
 const PROJ_CACHE = path.join(DSH, 'storages', 'session_projcache', 'sessions');
@@ -151,8 +166,25 @@ function verdictOf(s, opts) {
   }
   const open = Boolean(t.openTool || t.openTurn);
   const kind = t.openTool ? `tool/call(${t.openTool.name})` : t.openTurn ? 'open turn (waiting on model)' : `closed(${t.lastType})`;
-  const state = open && quietS > opts.staleS ? 'stuck' : open ? 'working' : 'idle';
-  return { id: s.id, title: titleOf(s.id) || '(untitled)', state, quietSeconds: quietS, tail: kind };
+  const strong = Boolean(t.openTool);            // a tool call that never returned
+  const strongS = opts.staleS;
+  const weakS = opts.staleS * OPEN_TURN_STALE_FACTOR;
+  const state = !open ? 'idle' : quietS > (strong ? strongS : weakS) ? 'stuck' : 'working';
+
+  return {
+    id: s.id,
+    title: titleOf(s.id) || '(untitled)',
+    state,
+    quietSeconds: quietS,
+    tail: kind,
+    /* the transcript's own mtime travels with the verdict: the busy/liveness bookkeeping reads it,
+     * and a caller that had to re-stat the file to get it would be a second source of truth */
+    mtime: s.mtime,
+    /* how this verdict earned the word "stuck", so a consumer never has to re-derive it:
+     * 'tool-call' is evidence; 'open-turn' is weak and deliberately never wakes anyone. */
+    signal: open ? (strong ? 'tool-call' : 'open-turn') : null,
+    thresholdSeconds: open ? (strong ? strongS : weakS) : null,
+  };
 }
 
 export function apply(ctx, config) {
@@ -188,7 +220,147 @@ export function apply(ctx, config) {
   /* Which live conversation should hear about a diagnosis. The browser reports its own session id;
    * config can pin one as a fallback. Nothing is hardcoded, because a session id is not stable. */
   let watcherSessionId = null;
-  const notified = new Map();   // session id -> last diagnosis cause we already reported
+
+  /*
+   * Who already knows. Keyed `${diagnosed id} -> ${recipient id}`, and checked BEFORE the message is
+   * sent, not after: the first version consulted it after followup() had already gone out, which
+   * meant it could trim a log line but never actually prevent a second message.
+   *
+   * Released when the diagnosed session stops being stuck, so a session that recovers and genuinely
+   * hangs again later is reported again.
+   */
+  const delivered = new Set();
+
+  /*
+   * Stuck sessions that have not been heard yet, and why. A notification that could not be delivered
+   * (nobody eligible, or every candidate was mid-turn) is NOT dropped - it waits here and is retried
+   * on later ticks. The first version only ever tried once, at the moment of transition, so a single
+   * busy recipient meant the alert vanished for good.
+   */
+  const pending = new Map();
+
+  /*
+   * Conversations this watchdog has woken. They are monitors, not suspects.
+   *
+   * This is the heart of the fix for the mutual-watch loop: A is flagged, so the plugin wakes B to
+   * look at A; B is busy, so it writes nothing, so it too gets flagged, so A is woken to look at B,
+   * and the two of them sit there watching each other forever - and each wake-up makes the other one
+   * look silent again.
+   *
+   * So: once this plugin has made a conversation part of the watching, it is not a suspect any more.
+   * It is excluded from the recipient list AND filtered out of the stuck list (both, because a
+   * same-tick race otherwise still lets one wake-up through - see the transition loop), and
+   * `session/event` arrival is what decides the window, not a bare timer, because a stuck-but-silent
+   * run reaches a tick with no transition at all.
+   *
+   * TIME-BOUNDED on purpose. A permanent ban is a silencing bug of its own: a conversation that was
+   * woken once could hang a week later and never be reported by anything. HOOK_WINDOW_MS is long
+   * enough to outlast the flapping (a slow model plus a rescan cycle) and short enough that a later,
+   * unrelated hang is still seen.
+   */
+  /*
+   * TIME-BOUNDED on purpose. A permanent ban is a silencing bug of its own: a conversation that was
+   * woken once could hang a week later and never be reported by anything. The window is long enough
+   * to outlast the flapping (a slow model plus a rescan cycle) and short enough that a later,
+   * unrelated hang is still seen.
+   *
+   * It is wall-clock, which is why it is also configurable: a test cannot age 30 real minutes, and an
+   * operator may have a reason to move it. The floor is derived from the interval rather than fixed,
+   * because a window shorter than a few ticks would let the loop back in; the default is 30 minutes.
+   */
+  const HOOK_WINDOW_MS = Math.max(1000, Number(config?.hookWindowSeconds ?? 1800) * 1000);
+  const GRACE_MS = 60_000;   // how long an evidence-of-life stamp survives without being refreshed
+  /*
+   * How long a "working" verdict stays authoritative. It has to outlive one tick - the guard is
+   * built from the previous pass and read during the next - so it is derived from the interval rather
+   * than fixed, with a floor so a very fast interval cannot make the guard evaporate instantly.
+   */
+  const verdictGraceMs = Math.max(30_000, intervalMs * 3);
+  const workingAt = new Map();   // session id -> when the verdict last called it 'working'
+  const monitors = new Map();   // session id -> when it was made a monitor
+
+  const isMonitor = (id, now) => {
+    const since = monitors.get(id);
+    if (since === undefined) return false;
+    if (now - since > HOOK_WINDOW_MS) { monitors.delete(id); return false; }
+    return true;
+  };
+
+  /*
+   * A Host with no agent registry cannot deliver a diagnosis to anybody. That is not the same as
+   * "everyone is busy", and a watchdog that cannot report must say so rather than look healthy -
+   * exactly the failure mode `available: false` already covers for transcripts, applied to delivery.
+   *
+   * Said ONCE, at load, instead of on every tick: a permanent condition repeated every 15 seconds is
+   * log spam, and spam is how a real warning stops being read. The snapshot carries the same fact for
+   * the page.
+   */
+  let notifyUnavailable = null;
+  const warnNoAgents = () => {
+    if (notifyUnavailable !== null) return;
+    notifyUnavailable = 'ctx.agents is unavailable, so a stuck session can be shown but never reported';
+    ctx.logger?.warn?.(`session-watch: ${notifyUnavailable}`);
+  };
+  if (!ctx.agents || typeof ctx.agents.roots !== 'function') warnNoAgents();
+
+  /*
+   * "Busy" must live at apply() scope, not inside tick().
+   *
+   * The first version of this fix declared it inside tick() and read it from notify() - an
+   * out-of-scope read that throws ReferenceError, which notify()'s own try/catch then swallowed into
+   * `{delivered: false}`. Every genuine alert was silently eaten while the snapshot still looked
+   * healthy. That is the worst failure this whole repo exists to prevent, and it is why the guard is
+   * a module-level Set updated by whichever caller knows something.
+   *
+   * The guard answers exactly one question - "did the last VERDICT call this conversation working?" -
+   * and it is deliberately time-bounded twice:
+   *
+   *   verdictGraceMs  the freshness of that verdict. A working verdict expires on its own, so a
+   *                   conversation that was working when we looked and went stuck since does not
+   *                   stay un-wakeable for long. (Measured the hard way: a monotonic "evidence of
+   *                   life" stamp instead made a session that had merely been BUSY EARLIER look
+   *                   permanently busy, so every report to it was deferred forever.)
+   *   lastSeen        evidence of life from events, which is what tells a genuinely streaming
+   *                   conversation (still mid-turn, still emitting) apart from one that has parked.
+   *
+   * Two sources feed it, because neither is sufficient alone: the verdict pass knows "open work that
+   * is still being written", and session/event knows "it did something just now", including writes
+   * the mtime has not caught up with yet.
+   */
+  const busyRoots = new Set();
+  const markBusy = (id) => { if (id) busyRoots.add(id); };
+  const isBusyRoot = (id, now) => {
+    if (!busyRoots.has(id)) return false;
+    const verdict = workingAt.get(id);
+    /*
+     * The verdict is authoritative, and BOTH stamps must be fresh.
+     *
+     * An earlier version refreshed only the verdict pass and let the flag persist, so a conversation
+     * that was mid-turn when we looked and had gone stuck by the next pass kept being skipped as
+     * "busy" - and because a retry is only attempted while the session is still stuck, the alert was
+     * deferred for exactly as long as the situation lasted. A guard that makes the watchdog mute
+     * precisely when it is needed is worse than no guard.
+     */
+    if (verdict === undefined || now - verdict > verdictGraceMs) { busyRoots.delete(id); return false; }
+    const alive = lastSeen.get(id);
+    if (alive === undefined || now - alive > verdictGraceMs) { busyRoots.delete(id); return false; }
+    return true;
+  };
+
+  /*
+   * Evidence of life, kept monotonic on purpose. An event stamps "alive now", and the next verdict
+   * pass would otherwise overwrite that with the transcript's older mtime and expire the stamp one
+   * line later - exactly how the guard would go missing in the tick right after the risky one.
+   */
+  const lastSeen = new Map();   // session id -> newest evidence-of-life timestamp we have observed
+  const markSeen = (id, at) => {
+    if (!id || typeof at !== 'number') return;
+    const prev = lastSeen.get(id);
+    if (prev === undefined || at > prev) lastSeen.set(id, at);
+    if (lastSeen.size > 512) {
+      for (const [k, v] of lastSeen) if (at - v > GRACE_MS * 5) { lastSeen.delete(k); busyRoots.delete(k); workingAt.delete(k); }
+    }
+  };
 
   let snapshot = {
     at: Date.now(),
@@ -220,26 +392,11 @@ export function apply(ctx, config) {
    * own id either (no session id is exposed to the browser), so the roots ARE the mechanism, with
    * `notifySessionId` available as an override.
    */
-  const notify = (diagnosis, title) => {
+  const notify = (diagnosis, title, recipients) => {
     if (!notifyEnabled || !diagnosisEnabled) return { delivered: false, reason: '通知已关闭' };
-
-    const recipients = [];
-    const wanted = watcherSessionId ?? notifySessionId;
-    try {
-      if (wanted) {
-        const agent = ctx.agents?.get?.(wanted);
-        if (agent) recipients.push(agent);
-        else return { delivered: false, reason: `指定的通知目标 ${wanted} 当前不是活的` };
-      } else {
-        for (const agent of ctx.agents?.roots?.() ?? []) {
-          if (agent && typeof agent.followup === 'function') recipients.push(agent);
-        }
-      }
-    } catch (error) {
-      return { delivered: false, reason: `无法枚举会话：${error?.message ?? error}` };
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return { delivered: false, reason: '当前没有可以叫醒的对话（其他会话可能正在干活）' };
     }
-
-    if (recipients.length === 0) return { delivered: false, reason: '当前没有可通知的顶层会话' };
 
     const lines = [
       `【会话监视】另一个对话卡住了，原因如下。我没有碰它，它仍然停在那里。`,
@@ -280,20 +437,20 @@ export function apply(ctx, config) {
       source: { kind: 'session-watch' },
     });
 
-    const delivered = [];
+    const sent = [];
     const failed = [];
     for (const agent of recipients) {
       if (agent.id === diagnosis.id) continue;   // never report a session to itself
       try {
         agent.followup(makeMessage(body));
-        delivered.push(agent.id);
+        sent.push(agent.id);
       } catch (error) {
         failed.push(`${agent.id}: ${error?.message ?? error}`);
       }
     }
-    if (delivered.length > 0) {
-      ctx.logger?.info?.(`session-watch: reported ${diagnosis.id} (${diagnosis.cause}) to ${delivered.join(', ')}`);
-      return { delivered: true, to: delivered };
+    if (sent.length > 0) {
+      ctx.logger?.info?.(`session-watch: reported ${diagnosis.id} (${diagnosis.cause}) to ${sent.join(', ')}`);
+      return { delivered: true, to: sent };
     }
     return { delivered: false, reason: failed.length ? failed.join('; ') : '没有可用的接收方（被诊断的会话可能就是唯一顶层会话）' };
   };
@@ -306,26 +463,62 @@ export function apply(ctx, config) {
       const rows = scope.map((s) => verdictOf(s, { now, staleS }));
       const pick = (state) => rows.filter((r) => r.state === state);
 
+      /*
+       * Expire monitor records explicitly, before anything reads them.
+       *
+       * The suppression is time-bounded, but "bounded" has to mean the session COMES BACK, not merely
+       * that `isMonitor` would answer false if asked. Without this sweep an expired conversation stays
+       * absent from the stuck list for the rest of the host's life - the watchdog would have gone
+       * quietly blind to exactly the conversations most likely to be busy. Dropping the record here
+       * makes the next line re-admit it as a normal suspect.
+       */
+      for (const [id, since] of monitors) {
+        if (now - since > HOOK_WINDOW_MS) monitors.delete(id);
+      }
+
+      /*
+       * Who is mid-turn right now, refreshed from this pass - and CLEARED for everyone else.
+       *
+       * `notify()` never wakes a conversation that is working: a followup lands inside work in
+       * progress, and the woken conversation then looks silent (and therefore stuck) to the next
+       * tick. But the flag has to be re-decided every pass. Leaving it set for a session the new
+       * verdict calls stuck is the bug that made the deferred-report path dead: the guard kept saying
+       * "busy" about a session that had already been flagged, so the retry it was waiting for could
+       * never fire.
+       */
+      for (const r of rows) {
+        markSeen(r.id, r.mtime);
+        if (r.state === 'working') { markBusy(r.id); workingAt.set(r.id, now); } else { workingAt.delete(r.id); }
+      }
+
       /* diagnose only what the verdict flagged, and only once per cause per session */
-      const stuck = pick('stuck').map((r) => {
-        const source = scope.find((s) => s.id === r.id);
-        let d = null;
-        if (diagnosisEnabled && source) {
-          d = diagnose({
-            file: source.file,
-            mtime: source.mtime,
-            now,
-            staleSeconds: staleS,
-            contentBudget,
-            authorizedBy,
-          });
-        }
-        return { ...r, diagnosis: d };
-      });
+      const stuck = pick('stuck')
+        /* A conversation this watchdog already woke is a monitor, not a suspect. Dropping it here
+         * (not just from the recipient list) is what actually breaks the loop: it leaves the stuck
+         * list AND stops the diagnosis, so it can neither be re-reported nor cascade. */
+        .filter((r) => !monitors.has(r.id))
+        .map((r) => {
+          const source = scope.find((s) => s.id === r.id);
+          let d = null;
+          if (diagnosisEnabled && source) {
+            d = diagnose({
+              file: source.file,
+              mtime: source.mtime,
+              now,
+              staleSeconds: r.thresholdSeconds ?? staleS,
+              contentBudget,
+              authorizedBy,
+            });
+          }
+          return { ...r, diagnosis: d };
+        });
 
       const next = {
         at: now,
         staleSeconds: staleS,
+        /* An open turn with no tool call is the weak signal and gets its own, longer window. The
+         * page shows this so the notice never has to hardcode a rule the host has already changed. */
+        weakStaleSeconds: staleS * OPEN_TURN_STALE_FACTOR,
         available: true,
         reason: null,
         diagnosis: { enabled: diagnosisEnabled, contentBudget, authorizedBy },
@@ -335,6 +528,8 @@ export function apply(ctx, config) {
           title: r.title,
           quietSeconds: r.quietSeconds,
           tail: r.tail,
+          signal: r.signal ?? null,
+          thresholdSeconds: r.thresholdSeconds ?? null,
           cause: r.diagnosis?.cause ?? null,
           summary: r.diagnosis?.summary ?? null,
           detail: r.diagnosis?.detail ?? null,
@@ -345,29 +540,155 @@ export function apply(ctx, config) {
         notifications: snapshot.notifications ?? [],
       };
 
+      /*
+       * Disclose what is being suppressed. A watchdog that silently drops candidates is
+       * indistinguishable from one that has nothing to say - the failure mode this whole repo exists
+       * to prevent - so the reason a session is NOT in `stuck` travels with the snapshot instead of
+       * being invisible. It also lets a test assert the suppression itself rather than a coincidence
+       * of file timestamps.
+       */
+      next.suppressed = rows
+        .filter((r) => isMonitor(r.id, now))
+        .map((r) => ({ id: r.id, verdict: r.state, reason: 'woken by session-watch: treated as a monitor, not a suspect' }));
+
+      /* the same disclosure for delivery: a snapshot that can never reach anyone must not look like
+       * one that simply has nothing to say */
+      next.notifyUnavailable = notifyUnavailable;
+
       /* announce transitions so a consumer can react without polling */
       const before = new Map(snapshot.sessions.map((s) => [s.id, s.state]));
+
+      /*
+       * Who may be woken about a given stuck session. Three rules, all applied at one place so no
+       * call path can quietly skip them (the first version guarded only the roots branch, so the
+       * pinned-target branch walked straight past both the monitor and the busy rule):
+       *
+       *   1. never the stuck session itself
+       *   2. never a conversation this watchdog has already made a monitor
+       *   3. never a conversation that is mid-turn
+       *
+       * Returning [] is NOT a failure to report - it means "nobody to tell right now", and the
+       * caller leaves the session in `pending` for a later tick instead of dropping the alert.
+       */
+      /*
+       * Who has already been made a monitor DURING THIS TICK.
+       *
+       * `monitors` is only written after a successful delivery, so an ordering that marks the id any
+       * earlier would leave `stuck` (built before this loop) stale. Keeping a tick-local view and
+       * consulting it first means the second half of a simultaneous pair is skipped no matter what
+       * happened to the first delivery - including a followup() that threw for every candidate.
+       */
+      const monitorsThisTick = new Set();
+
+      const eligibleRecipients = (diagnosedId) => {
+        /* No registry at all is not the same as "everyone is busy": it means a diagnosis can never
+         * reach a person. Guarded explicitly, because optional chaining would turn this into a silent
+         * empty list - which is what made the first version of this fix unable to tell "nobody to
+         * tell" apart from "nothing wrong". */
+        if (!ctx.agents || typeof ctx.agents.roots !== 'function') { warnNoAgents(); return []; }
+        const wanted = watcherSessionId ?? notifySessionId;
+        let roster;
+        try {
+          if (wanted) {
+            const agent = ctx.agents?.get?.(wanted);
+            /* a pinned target that is no longer live falls back to roots rather than reporting to
+             * nobody: a stale pin must not be able to silence the watchdog */
+            roster = agent ? [agent] : (ctx.agents?.roots?.() ?? []);
+          } else {
+            roster = ctx.agents?.roots?.() ?? [];
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(`session-watch: cannot enumerate conversations: ${error?.message ?? error}`);
+          return [];
+        }
+        const out = [];
+        for (const agent of roster) {
+          if (!agent || typeof agent.followup !== 'function') continue;
+          if (agent.id === diagnosedId) continue;
+          if (monitorsThisTick.has(agent.id)) continue;
+          if (isMonitor(agent.id, now)) continue;
+          if (isBusyRoot(agent.id, now)) continue;
+          out.push(agent);
+        }
+        return out;
+      };
+
+      const recordNotification = (row, to) => {
+        next.notifications = [...next.notifications, {
+          at: now, id: row.id, title: row.title, cause: row.diagnosis.cause, signal: row.signal,
+          summary: row.diagnosis.summary, delivered: true, to,
+        }].slice(-20);
+      };
+
       for (const s of next.sessions) {
         const was = before.get(s.id);
         if (was !== s.state && (s.state === 'stuck' || was === 'stuck')) {
           ctx.emit('session-watch/changed', { id: s.id, title: s.title, from: was ?? null, to: s.state, quietSeconds: s.quietSeconds, tail: s.tail });
           ctx.logger?.info?.(`session-watch: ${was ?? 'new'} -> ${s.state}  ${s.id}  quiet ${s.quietSeconds}s`);
-
-          /* a new arrival in the stuck state gets a diagnosis and, if possible, a message */
-          const row = stuck.find((r) => r.id === s.id);
-          if (s.state === 'stuck' && row?.diagnosis) {
-            if (notified.get(s.id) !== row.diagnosis.cause) {
-              const result = notify(row.diagnosis, row.title);
-              notified.set(s.id, row.diagnosis.cause);
-              next.notifications = [...(snapshot.notifications ?? []), {
-                at: now, id: s.id, title: row.title, cause: row.diagnosis.cause,
-                summary: row.diagnosis.summary, delivered: Boolean(result?.delivered), reason: result?.reason ?? null,
-              }].slice(-20);
-            }
-            ctx.logger?.info?.(`session-watch diagnosis ${s.id}: ${row.diagnosis.cause} — ${row.diagnosis.summary}`);
-          }
         }
-        if (was === 'stuck' && s.state !== 'stuck') notified.delete(s.id);   // re-arm after recovery
+
+        /* dropping a session out of `stuck` releases everyone it was reported to, so a later,
+         * unrelated hang is reportable again */
+        if (was === 'stuck' && s.state !== 'stuck') {
+          for (const key of [...delivered]) {
+            if (key.startsWith(s.id + ' -> ')) delivered.delete(key);
+          }
+          pending.delete(s.id);
+        }
+      }
+
+      /*
+       * REPORTING, deliberately after the transition loop and deliberately retried.
+       *
+       * The first version called notify() from inside the transition branch and forgot the result.
+       * Two consequences, both bad: a same-tick pair of stuck sessions still woke each other (the
+       * `stuck` array was built before `monitors` was updated, so both looked like legal recipients),
+       * and an alert whose only recipient happened to be busy was gone for good.
+       *
+       * Every stuck, wakeable, diagnosed, not-yet-delivered session is a candidate - whether it
+       * arrived this tick or ten ticks ago.
+       */
+      const stuckNow = new Set(stuck.map((r) => r.id));
+      for (const id of [...pending.keys()]) {
+        if (!stuckNow.has(id)) pending.delete(id);   // it recovered while we were waiting
+      }
+
+      for (const row of stuck) {
+        if (row.signal !== 'tool-call') continue;    // weak signal: on screen only, never wakes anyone
+        if (!row.diagnosis) continue;
+        if (isMonitor(row.id, now)) continue;        // no self-referential politeness: a monitor is out
+
+        /* The transition loop above runs in the snapshot's order, so by the time we get here every
+         * session woken earlier in THIS tick is already flagged and skipped. That ordering is what
+         * closes the same-tick race. */
+        const candidates = eligibleRecipients(row.id).filter((a) => !delivered.has(`${row.id} -> ${a.id}`));
+
+        if (candidates.length === 0) {
+          /* record the diagnosis, keep it for retry, and do NOT log a delivery */
+          const noise = (snapshot.notifications ?? []).some((n) => n.id === row.id && n.cause === row.diagnosis.cause);
+          pending.set(row.id, { diagnosis: row.diagnosis, title: row.title, signal: row.signal, since: now });
+          if (!noise) {
+            ctx.logger?.info?.(`session-watch: ${row.id} (${row.diagnosis.cause}) has nobody to report to yet; will retry`);
+          }
+          continue;
+        }
+
+        /* `diagnose()` is a pure function over a transcript and has no idea which session it was
+         * handed, so the id is attached here - otherwise the delivery log says "reported undefined",
+         * which is how a watchdog's own audit trail becomes useless. */
+        const result = notify({ ...row.diagnosis, id: row.id }, row.title, candidates);
+        if (!result?.delivered) {
+          pending.set(row.id, { diagnosis: row.diagnosis, title: row.title, signal: row.signal, since: now });
+          continue;
+        }
+        for (const target of result.to) {
+          delivered.add(`${row.id} -> ${target}`);
+          monitors.set(target, now);   // it is part of the watching now; not a suspect any more
+          monitorsThisTick.add(target);
+        }
+        pending.delete(row.id);
+        recordNotification(row, result.to);
+        ctx.logger?.info?.(`session-watch diagnosis ${row.id}: ${row.diagnosis.cause} (${row.signal}) — ${row.diagnosis.summary}`);
       }
       snapshot = next;
     } catch (error) {
@@ -415,6 +736,14 @@ export function apply(ctx, config) {
         const id = session?.id ?? args[0]?.id ?? null;
         if (id === null) return;
 
+        /*
+         * An event IS evidence of life. This is the second, independent busy signal: the mtime has
+         * not necessarily caught up with a session that has just started writing, and a session that
+         * is mid-turn must not be woken. Without this the guard can be one tick stale, which is
+         * precisely the window the mutual-watch loop used to slip through.
+         */
+        markBusy(id);
+        markSeen(id, Date.now());
         const was = lastKnownState.get(id);
         if (was === undefined || was === 'working' || was === 'stuck') scheduleRescan();
       } catch { /* an event listener must never break the Host */ }
