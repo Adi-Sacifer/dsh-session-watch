@@ -103,7 +103,15 @@
   function render(state) {
     if (state && state.available === false) { renderUnavailable(state); return; }
     var stuck = state && state.stuck ? state.stuck : [];
-    if (dismissed || stuck.length === 0) { remove(); return; }
+    var sessions = state && state.sessions ? state.sessions : [];
+    /*
+     * A session waiting on ask_user_question is NOT stuck, but it is the one thing a person most wants
+     * to be told: it explains why a conversation has gone quiet without anything being wrong. So it is
+     * shown, and it must be able to show WITHOUT any stuck session - otherwise the "nothing is wrong"
+     * gate below would hide the only useful line.
+     */
+    var waitingOnMe = sessions.filter(function (s) { return s.state === 'waiting-for-human'; });
+    if (dismissed || (stuck.length === 0 && waitingOnMe.length === 0)) { remove(); return; }
 
     ensureStyles();
     var el = document.getElementById(ID);
@@ -126,7 +134,17 @@
 
     var head = document.createElement('div');
     head.className = 'sw-head';
-    head.textContent = stuck.length === 1 ? '1 个会话可能卡住了' : stuck.length + ' 个会话可能卡住了';
+    /*
+     * "Stuck" and "waiting for you" are different claims and must not share a headline.
+     *
+     * A session parked on ask_user_question is not in trouble - it is waiting for a decision that only
+     * a person can make. Reporting it as possibly-stuck is doubly wrong: it is false, and the remedy
+     * suggested by these notices ("go look") is the very thing that would answer it. So they get their
+     * own line, with a note that the wait is the intended state.
+     */
+    head.textContent = stuck.length === 0
+      ? (waitingOnMe.length === 1 ? '1 个会话在等你回答' : waitingOnMe.length + ' 个会话在等你回答')
+      : (stuck.length === 1 ? '1 个会话可能卡住了' : stuck.length + ' 个会话可能卡住了');
     box.appendChild(head);
 
     stuck.slice(0, 4).forEach(function (s) {
@@ -143,6 +161,13 @@
         detail.textContent = '↳ ' + s.detail;
         box.appendChild(detail);
       }
+    });
+
+    waitingOnMe.slice(0, 2).forEach(function (s) {
+      var row = document.createElement('div');
+      row.className = 'sw-row';
+      row.textContent = (s.title || s.id) + ' · 在等你回答 · 已等 ' + s.quietSeconds + 's';
+      box.appendChild(row);
     });
 
     if (stuck.length > 4) {

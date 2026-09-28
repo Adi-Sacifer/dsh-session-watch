@@ -198,6 +198,21 @@ function tail(records) {
   return { openTool, openTurn, lastType: records.length ? records[records.length - 1].type : null };
 }
 
+/**
+ * Tools that BLOCK ON A HUMAN, not on the machine.
+ *
+ * `ask_user_question` parks the turn until a person picks an option, and a person is allowed to think
+ * for ten minutes. Measured: a session was reported stuck at 313s while what it was actually doing was
+ * sitting on a question to its user - and the watch notice's own suggested remedy is "① 去看一眼",
+ * which is exactly the thing that would have answered it. A watchdog that alarms about the user's own
+ * pending decision, and whose advice is "go look", is asking to be clicked and then clicked again.
+ *
+ * This is a different case from a long-running tool. There the budget is knowable and the tool
+ * declares it (see declaredBudgetS / thresholdFor). Here there is no budget and no honest upper bound:
+ * silence is not evidence of trouble, it is evidence that nobody has answered yet.
+ */
+const HUMAN_WAIT_TOOLS = new Set(['ask_user_question', 'askuserquestion', 'ask_user']);
+
 /** One session -> one verdict. Returns the exact shape the UI and events consume. */
 function verdictOf(s, opts) {
   const quietS = Math.round((opts.now - s.mtime) / 1000);
@@ -213,9 +228,13 @@ function verdictOf(s, opts) {
   const open = Boolean(t.openTool || t.openTurn);
   const kind = t.openTool ? `tool/call(${t.openTool.name})` : t.openTurn ? 'open turn (waiting on model)' : `closed(${t.lastType})`;
   const strong = Boolean(t.openTool);            // a tool call that never returned
+  /* waiting for a person is not a hang and must never be reported as one */
+  const awaitingHuman = Boolean(t.openTool && HUMAN_WAIT_TOOLS.has(String(t.openTool.name).toLowerCase()));
   const strongS = opts.staleS;
   const weakS = opts.staleS * OPEN_TURN_STALE_FACTOR;
-  const state = !open ? 'idle' : quietS > (strong ? strongS : weakS) ? 'stuck' : 'working';
+  const state = !open ? 'idle'
+    : awaitingHuman ? 'waiting-for-human'
+      : quietS > (strong ? strongS : weakS) ? 'stuck' : 'working';
 
   return {
     id: s.id,
@@ -227,12 +246,13 @@ function verdictOf(s, opts) {
      * and a caller that had to re-stat the file to get it would be a second source of truth */
     mtime: s.mtime,
     /* how this verdict earned the word "stuck", so a consumer never has to re-derive it:
-     * 'tool-call' is evidence; 'open-turn' is weak and deliberately never wakes anyone. */
-    signal: open ? (strong ? 'tool-call' : 'open-turn') : null,
-    thresholdSeconds: open ? (strong ? strongS : weakS) : null,
+     * 'tool-call' is evidence; 'open-turn' is weak and deliberately never wakes anyone;
+     * 'awaiting-human' means a person owes this session an answer. */
+    signal: !open ? null : awaitingHuman ? 'awaiting-human' : strong ? 'tool-call' : 'open-turn',
+    thresholdSeconds: open && !awaitingHuman ? (strong ? strongS : weakS) : null,
     /* what the pending call asked for itself, so the tick can decide whether silence is still
      * patience. Only meaningful for the strong signal. */
-    declaredBudgetSeconds: strong ? budgetS : null,
+    declaredBudgetSeconds: strong && !awaitingHuman ? budgetS : null,
   };
 }
 
@@ -410,6 +430,20 @@ export function apply(ctx, config) {
    */
   const busyRoots = new Set();
   const markBusy = (id) => { if (id) busyRoots.add(id); };
+
+  /*
+   * Conversations that are waiting for their own user to answer something.
+   *
+   * This is a separate rule from "busy", and the separation is the point. `isBusyRoot` is deliberately
+   * short-lived - it only holds while the TRANSCRIPT IS MOVING - because a session that stopped moving
+   * must stay wakeable. But a session parked on `ask_user_question` has stopped moving BY DEFINITION,
+   * so the busy guard can never protect it, and it would be woken with a report about somebody else
+   * while its own question sits unanswered. Piling a second question on top of the first is the
+   * precise noise a watchdog should not make.
+   *
+   * So: waiting on a human means "do not nudge me about anything else", independent of liveness.
+   */
+  const awaitingHumanRoots = new Set();
   const isBusyRoot = (id, now) => {
     if (!busyRoots.has(id)) return false;
     const verdict = workingAt.get(id);
@@ -424,7 +458,8 @@ export function apply(ctx, config) {
      */
     if (verdict === undefined || now - verdict > verdictGraceMs) { busyRoots.delete(id); return false; }
     const alive = lastSeen.get(id);
-    if (alive === undefined || now - alive > verdictGraceMs) { busyRoots.delete(id); return false; }
+    /* `at` - what the evidence said - so a genuinely parked transcript stops counting as alive */
+    if (alive === undefined || now - alive.at > verdictGraceMs) { busyRoots.delete(id); return false; }
     return true;
   };
 
@@ -433,13 +468,35 @@ export function apply(ctx, config) {
    * pass would otherwise overwrite that with the transcript's older mtime and expire the stamp one
    * line later - exactly how the guard would go missing in the tick right after the risky one.
    */
-  const lastSeen = new Map();   // session id -> newest evidence-of-life timestamp we have observed
-  const markSeen = (id, at) => {
+  /*
+   * Evidence of life, and the distinction that matters: WHEN WE OBSERVED IT is not the same as WHAT IT
+   * SAID. An event is "alive right now"; a verdict is "this file was last written at mtime", which for
+   * a quiet session is old by definition.
+   *
+   * Mixing the two cost a real bug: `markSeen(id, r.mtime)` stored the transcript's mtime, so a session
+   * that had been silent for 30 minutes recorded an `alive` stamp 30 minutes in the past - and the
+   * freshness check below then measured the QUIET DURATION against a 45s grace window and concluded
+   * the session was not busy. Everything downstream depended on that flag.
+   *
+   *   at        what the evidence says (the mtime, or now for an event)
+   *   observed  when we saw it (monotonic: never goes backwards, so a verdict cannot un-see an event)
+   *
+   * `at` is what the grace window compares against; `observed` is what proves an event has not been
+   * overwritten by a later, staler read.
+   */
+  const lastSeen = new Map();   // session id -> { at, observed, source }
+  const markSeen = (id, at, source = 'verdict') => {
     if (!id || typeof at !== 'number') return;
     const prev = lastSeen.get(id);
-    if (prev === undefined || at > prev) lastSeen.set(id, at);
+    /* an event always wins over a verdict; otherwise the newest evidence wins */
+    if (prev === undefined || source === 'event' || at > prev.at) {
+      lastSeen.set(id, { at, observed: Date.now(), source });
+    } else {
+      prev.observed = Date.now();
+    }
     if (lastSeen.size > 512) {
-      for (const [k, v] of lastSeen) if (at - v > GRACE_MS * 5) { lastSeen.delete(k); busyRoots.delete(k); workingAt.delete(k); }
+      const cutoff = Date.now() - GRACE_MS * 5;
+      for (const [k, v] of lastSeen) if (v.observed < cutoff) { lastSeen.delete(k); busyRoots.delete(k); workingAt.delete(k); }
     }
   };
 
@@ -590,7 +647,15 @@ export function apply(ctx, config) {
        */
       for (const r of rows) {
         markSeen(r.id, r.mtime);
-        if (r.state === 'working') { markBusy(r.id); workingAt.set(r.id, now); } else { workingAt.delete(r.id); }
+        /*
+         * A session waiting on its user is BUSY, not idle and not stuck: the turn is very much open
+         * and the next move is a person's. Treating it as working also keeps it out of the recipient
+         * list, which matters - waking a conversation that is already waiting for you to answer is
+         * noise on top of the question you have not answered yet.
+         */
+        if (r.state === 'working' || r.state === 'waiting-for-human') { markBusy(r.id); workingAt.set(r.id, now); } else { workingAt.delete(r.id); }
+        /* ...and the human-wait flag is remembered regardless of how stale the transcript is */
+        if (r.state === 'waiting-for-human') awaitingHumanRoots.add(r.id); else awaitingHumanRoots.delete(r.id);
       }
 
       /* diagnose only what the verdict flagged, and only once per cause per session */
@@ -664,6 +729,13 @@ export function apply(ctx, config) {
        * one that simply has nothing to say */
       next.notifyUnavailable = notifyUnavailable;
 
+      /*
+       * Aggregate the state the counts were silently missing. `waiting-for-human` was not in any
+       * bucket, which would have made a session vanish from the summary while still appearing in
+       * `sessions` - the kind of arithmetic gap that makes a snapshot contradict itself.
+       */
+      next.waitingForHuman = next.sessions.filter((s) => s.state === 'waiting-for-human').length;
+
       /* announce transitions so a consumer can react without polling */
       const before = new Map(snapshot.sessions.map((s) => [s.id, s.state]));
 
@@ -716,6 +788,8 @@ export function apply(ctx, config) {
           if (agent.id === diagnosedId) continue;
           if (monitorsThisTick.has(agent.id)) continue;
           if (isMonitor(agent.id, now)) continue;
+          /* never stack a second question on a conversation that is already waiting for an answer */
+          if (awaitingHumanRoots.has(agent.id)) continue;
           if (isBusyRoot(agent.id, now)) continue;
           out.push(agent);
         }
@@ -852,7 +926,7 @@ export function apply(ctx, config) {
          * precisely the window the mutual-watch loop used to slip through.
          */
         markBusy(id);
-        markSeen(id, Date.now());
+        markSeen(id, Date.now(), 'event');
         const was = lastKnownState.get(id);
         if (was === undefined || was === 'working' || was === 'stuck') scheduleRescan();
       } catch { /* an event listener must never break the Host */ }
