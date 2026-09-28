@@ -268,7 +268,20 @@ try {
   edge.kill();
   server.close();
   await sleep(300);
-  fs.rmSync(profileDir, { recursive: true, force: true });
+  /*
+   * Removing Edge's profile dir must not be able to destroy the RESULT.
+   *
+   * Measured: Edge (or a helper it spawned) can still hold the directory a moment after kill, and
+   * rmSync then throws EPERM. Unhandled, that exception propagated out of this `finally`, so the
+   * process died BEFORE the summary below printed - the run showed a stack trace instead of "19
+   * assertions passed", and looked like a broken build when every assertion had in fact passed.
+   * A test whose cleanup can erase its own verdict is worse than no test, so this retries and then
+   * gives up quietly: a leftover temp directory is untidy, not a failure.
+   */
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { fs.rmSync(profileDir, { recursive: true, force: true }); break; }
+    catch { await sleep(250 * (attempt + 1)); }
+  }
 }
 
 console.log(`notice-render: real browser check on port ${PORT}`);

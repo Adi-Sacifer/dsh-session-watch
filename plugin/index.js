@@ -103,6 +103,48 @@ export function makeNoticeInjection(noticeRoute, stateRoute, watcherRoute) {
  */
 const OPEN_TURN_STALE_FACTOR = 4;
 
+/*
+ * A TOOL THAT DECLARED ITS OWN TIMEOUT GETS TO USE IT - up to a point.
+ *
+ * Measured, twice, against a real session: a `pwsh` call that declared `timeoutMs: 900000` (15 min)
+ * and then `timeoutMs: 1500000` (25 min) was reported as stuck at 302s of silence while it was
+ * working perfectly. The watchdog was reading "how long has this been quiet" and ignoring the one
+ * piece of evidence sitting right there in the transcript: the call had told everyone how long it
+ * intended to take.
+ *
+ * So the threshold now defers to the declaration. But not blindly - the user's objection is exactly
+ * right: "要是他给自己定2h我就白白看着吗" - if a call declares two hours, honouring it means the
+ * watchdog says nothing for two hours, which is how a watchdog becomes furniture.
+ *
+ * Three tiers, in this order:
+ *   1. no declaration      -> staleSeconds (the default). Unchanged behaviour, most calls land here.
+ *   2. declared, sane      -> the declaration (plus a margin), because a long test suite is work.
+ *   3. declared, absurd    -> capped at MAX_BUDGET_SECONDS. The watchdog stops being patient here
+ *                             and flags anyway, so "I gave myself two hours" cannot silence it.
+ */
+const BUDGET_GRACE = 1.5;
+const MAX_BUDGET_SECONDS = 1200;
+
+/** The `timeoutMs` a pending call declared for itself, in seconds, or null when it declared none. */
+function declaredBudgetS(records) {
+  let open = null;
+  const done = new Set();
+  for (const r of records) {
+    if (!r || !r.type) continue;
+    if (r.type === 'tool/call') open = r;
+    else if (r.type === 'tool/result') {
+      const id = r.data?.callId ?? r.data?.message?.toolCallId;
+      done.add(id);
+      if (open && open.data?.callId === id) open = null;
+    } else if (r.type === 'turn/end') open = null;
+  }
+  if (!open) return null;
+  const m = /"timeoutMs"\s*:\s*(\d+)/.exec(String(open.data?.arguments ?? ''));
+  if (!m) return null;
+  const seconds = Math.round(Number(m[1]) / 1000);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
 const DSH = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const SESS_ROOT = path.join(DSH, 'sessions');
 const PROJ_CACHE = path.join(DSH, 'storages', 'session_projcache', 'sessions');
@@ -160,8 +202,11 @@ function tail(records) {
 function verdictOf(s, opts) {
   const quietS = Math.round((opts.now - s.mtime) / 1000);
   let t;
+  let budgetS = null;
   try {
-    t = tail(readRecords(s.file));
+    const records = readRecords(s.file);
+    t = tail(records);
+    budgetS = declaredBudgetS(records);
   } catch (error) {
     return { id: s.id, title: titleOf(s.id) || '(untitled)', state: 'unreadable', quietSeconds: quietS, tail: String(error?.message ?? error) };
   }
@@ -185,6 +230,9 @@ function verdictOf(s, opts) {
      * 'tool-call' is evidence; 'open-turn' is weak and deliberately never wakes anyone. */
     signal: open ? (strong ? 'tool-call' : 'open-turn') : null,
     thresholdSeconds: open ? (strong ? strongS : weakS) : null,
+    /* what the pending call asked for itself, so the tick can decide whether silence is still
+     * patience. Only meaningful for the strong signal. */
+    declaredBudgetSeconds: strong ? budgetS : null,
   };
 }
 
@@ -213,7 +261,27 @@ export function apply(ctx, config) {
 
   const intervalMs = Math.max(5, Number(config?.intervalSeconds ?? 15)) * 1000;
   const staleS = Math.max(30, Number(config?.staleSeconds ?? 300));
+  /* The ceiling on honouring a tool's self-declared timeout. See the three tiers above
+   * MAX_BUDGET_SECONDS: past this the watchdog stops being patient, because "I gave myself two hours"
+   * must not be able to buy two hours of silence. */
+  const maxBudgetS = Math.max(staleS, Number(config?.maxBudgetSeconds ?? MAX_BUDGET_SECONDS));
   const windowMin = Math.max(10, Number(config?.windowMinutes ?? 1440));
+
+  /**
+   * How long may THIS session be silent before silence means trouble?
+   *
+   * tier 1 - nothing declared: staleSeconds. Most calls land here.
+   * tier 2 - declared and sane: the declaration, plus a margin (a tool that said 900s and has been
+   *          quiet 950s is finishing, not hanging).
+   * tier 3 - declared beyond the ceiling: the ceiling, plus the same margin. The declaration is
+   *          capped rather than obeyed, so an absurd budget cannot silence the watchdog.
+   */
+  const thresholdFor = (row) => {
+    const declared = row.declaredBudgetSeconds;
+    if (!Number.isFinite(declared) || declared === null) return staleS;
+    const honoured = Math.min(declared, maxBudgetS);
+    return Math.max(staleS, Math.round(honoured * BUDGET_GRACE));
+  };
 
   /*
    * Diagnosis configuration.
@@ -477,6 +545,27 @@ export function apply(ctx, config) {
       const pick = (state) => rows.filter((r) => r.state === state);
 
       /*
+       * A tool that declared a long timeout is STILL WORKING until its own budget runs out.
+       *
+       * verdictOf() only knows the flat rule, so a call that said `timeoutMs: 1500000` (25 min) is
+       * flagged at staleSeconds like any other. This is where the declaration is honoured: a strong
+       * signal inside its (capped) budget is demoted back to working, with the reason recorded so the
+       * snapshot explains itself instead of silently dropping a candidate.
+       *
+       * Only demotion happens here. Everything past its budget keeps the verdict it already had, so
+       * the ceiling in thresholdFor() is what stops an absurd declaration from silencing the watchdog.
+       */
+      for (const r of rows) {
+        if (r.state !== 'stuck' || r.signal !== 'tool-call') continue;
+        const limit = thresholdFor(r);
+        if (limit <= r.thresholdSeconds) continue;      // no declaration worth honouring
+        if (r.quietSeconds <= limit) {
+          r.budgetHold = { declaredSeconds: r.declaredBudgetSeconds, limitSeconds: limit };
+          r.state = 'working';
+        }
+      }
+
+      /*
        * Expire monitor records explicitly, before anything reads them.
        *
        * The suppression is time-bounded, but "bounded" has to mean the session COMES BACK, not merely
@@ -549,7 +638,14 @@ export function apply(ctx, config) {
           confidence: r.diagnosis?.confidence ?? null,
           read: r.diagnosis?.read ?? [],
         })),
-        sessions: rows.map((r) => ({ id: r.id, state: r.state, quietSeconds: r.quietSeconds, tail: r.tail })),
+        sessions: rows.map((r) => ({
+          id: r.id,
+          state: r.state,
+          quietSeconds: r.quietSeconds,
+          tail: r.tail,
+          /* why a strong-looking signal is not in the stuck list: it told us how long it needs */
+          budgetHold: r.budgetHold ?? null,
+        })),
         notifications: snapshot.notifications ?? [],
       };
 
