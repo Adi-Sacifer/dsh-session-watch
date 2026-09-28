@@ -746,6 +746,16 @@ export function apply(ctx, config) {
        */
       next.waitingForHuman = next.sessions.filter((s) => s.state === 'waiting-for-human').length;
 
+      /*
+       * Expose which conversation the PAGE is showing.
+       *
+       * The notice already knows (the page posts its own id), and any other surface that wants to say
+       * "this one is asking" needs the same answer - otherwise each consumer re-derives it, and they
+       * drift. It is also how the badge distinguishes "the window in front of you is asking" from
+       * "somewhere else needs you", which the user asked to be able to tell apart.
+       */
+      next.selfSessionId = watcherSessionId ?? notifySessionId;
+
       /* announce transitions so a consumer can react without polling */
       const before = new Map(snapshot.sessions.map((s) => [s.id, s.state]));
 
