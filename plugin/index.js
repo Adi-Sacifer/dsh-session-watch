@@ -330,7 +330,19 @@ export function apply(ctx, config) {
    * Released when the diagnosed session stops being stuck, so a session that recovers and genuinely
    * hangs again later is reported again.
    */
-  const delivered = new Set();
+  /*
+   * Sessions already announced, so ONE incident produces ONE message no matter how many ticks pass.
+   *
+   * This replaced a per-PAIR key (`session -> recipient`), and the difference is the whole point. With
+   * a pair key, excluding the already-woken recipient did not stop the alert - it MOVED it: the
+   * candidate list lost alice (now a monitor), so the next tick's "best" choice became bob, then
+   * carol, and one hang woke three conversations one per tick. That is precisely the user's report,
+   * "一次性还是会唤起一堆监工", surviving the loop fix.
+   *
+   * The incident is the unit of work: once somebody has been told, nobody else needs to be. It is
+   * released when the session stops being stuck, so a genuine second hang is reported again.
+   */
+  const announced = new Set();
 
   /*
    * Stuck sessions that have not been heard yet, and why. A notification that could not be delivered
@@ -625,11 +637,9 @@ export function apply(ctx, config) {
       /*
        * Expire monitor records explicitly, before anything reads them.
        *
-       * The suppression is time-bounded, but "bounded" has to mean the session COMES BACK, not merely
-       * that `isMonitor` would answer false if asked. Without this sweep an expired conversation stays
-       * absent from the stuck list for the rest of the host's life - the watchdog would have gone
-       * quietly blind to exactly the conversations most likely to be busy. Dropping the record here
-       * makes the next line re-admit it as a normal suspect.
+       * When a monitor NEVER expires, the stuck list shows a conversation we deliberately chose not to
+       * act on. That is not harmless: the list is what a person reads, and a row nobody can explain
+       * ("I was told about this and told not to worry") trains them to ignore the whole notice.
        */
       for (const [id, since] of monitors) {
         if (now - since > HOOK_WINDOW_MS) monitors.delete(id);
@@ -761,40 +771,66 @@ export function apply(ctx, config) {
        */
       const monitorsThisTick = new Set();
 
+      /*
+       * Pick the ONE conversation to wake, or none.
+       *
+       * `eligible` is the whole rule for "is this conversation a legal recipient right now", and it
+       * lives here rather than in notify() so that every path - pinned or not - is filtered by the
+       * same test. The first version checked some of these rules in notify() and the pinned branch
+       * walked straight past the rest.
+       */
+      const eligible = (agent, diagnosedId) => Boolean(
+        agent
+        && typeof agent.followup === 'function'
+        && agent.id !== diagnosedId
+        && !monitorsThisTick.has(agent.id)
+        && !isMonitor(agent.id, now)
+        && !awaitingHumanRoots.has(agent.id)     // never stack a second question on a pending one
+        && !isBusyRoot(agent.id, now));
+
       const eligibleRecipients = (diagnosedId) => {
         /* No registry at all is not the same as "everyone is busy": it means a diagnosis can never
          * reach a person. Guarded explicitly, because optional chaining would turn this into a silent
          * empty list - which is what made the first version of this fix unable to tell "nobody to
          * tell" apart from "nothing wrong". */
         if (!ctx.agents || typeof ctx.agents.roots !== 'function') { warnNoAgents(); return []; }
+
         const wanted = watcherSessionId ?? notifySessionId;
+        if (wanted) {
+          let pinned;
+          try { pinned = ctx.agents?.get?.(wanted); } catch { pinned = undefined; }
+          /*
+           * A pin falls back to the roots ONLY when the pinned conversation is GONE.
+           *
+           * Falling back whenever the pin was merely ineligible defeated the pin itself: pinning
+           * "report only to X" quietly reported to somebody else the moment X was busy, which is the
+           * behaviour a pin exists to prevent. Gone means the host no longer has it at all.
+           */
+          if (pinned) return eligible(pinned, diagnosedId) ? [pinned] : [];
+        }
+
         let roster;
         try {
-          if (wanted) {
-            const agent = ctx.agents?.get?.(wanted);
-            /* a pinned target that is no longer live falls back to roots rather than reporting to
-             * nobody: a stale pin must not be able to silence the watchdog */
-            roster = agent ? [agent] : (ctx.agents?.roots?.() ?? []);
-          } else {
-            roster = ctx.agents?.roots?.() ?? [];
-          }
+          roster = ctx.agents?.roots?.() ?? [];
         } catch (error) {
           ctx.logger?.warn?.(`session-watch: cannot enumerate conversations: ${error?.message ?? error}`);
           return [];
         }
-        const out = [];
-        for (const agent of roster) {
-          if (!agent || typeof agent.followup !== 'function') continue;
-          if (agent.id === diagnosedId) continue;
-          if (monitorsThisTick.has(agent.id)) continue;
-          if (isMonitor(agent.id, now)) continue;
-          /* never stack a second question on a conversation that is already waiting for an answer */
-          if (awaitingHumanRoots.has(agent.id)) continue;
-          if (isBusyRoot(agent.id, now)) continue;
-          out.push(agent);
-        }
-        return out;
+
+        const candidates = roster.filter((agent) => eligible(agent, diagnosedId));
+        if (candidates.length <= 1) return candidates;
+
+        /*
+         * Most recently active wins. `lastSeen.observed` is when we last saw anything from it, which
+         * is present for every session the verdict pass has looked at; a root with no record at all
+         * sorts last rather than being excluded, because "we have never looked at it" is not evidence
+         * that it is a bad choice.
+         */
+        const rank = (agent) => lastSeen.get(agent.id)?.observed ?? 0;
+        candidates.sort((a, b) => rank(b) - rank(a));
+        return [candidates[0]];
       };
+
 
       const recordNotification = (row, to) => {
         next.notifications = [...next.notifications, {
@@ -810,12 +846,9 @@ export function apply(ctx, config) {
           ctx.logger?.info?.(`session-watch: ${was ?? 'new'} -> ${s.state}  ${s.id}  quiet ${s.quietSeconds}s`);
         }
 
-        /* dropping a session out of `stuck` releases everyone it was reported to, so a later,
-         * unrelated hang is reportable again */
+        /* recovery releases the incident, so a later, unrelated hang is reportable again */
         if (was === 'stuck' && s.state !== 'stuck') {
-          for (const key of [...delivered]) {
-            if (key.startsWith(s.id + ' -> ')) delivered.delete(key);
-          }
+          announced.delete(s.id);
           pending.delete(s.id);
         }
       }
@@ -844,7 +877,10 @@ export function apply(ctx, config) {
         /* The transition loop above runs in the snapshot's order, so by the time we get here every
          * session woken earlier in THIS tick is already flagged and skipped. That ordering is what
          * closes the same-tick race. */
-        const candidates = eligibleRecipients(row.id).filter((a) => !delivered.has(`${row.id} -> ${a.id}`));
+        /* already announced: this incident is done, however the candidate list has changed since */
+        if (announced.has(row.id)) continue;
+
+        const candidates = eligibleRecipients(row.id);
 
         if (candidates.length === 0) {
           /* record the diagnosis, keep it for retry, and do NOT log a delivery */
@@ -865,7 +901,7 @@ export function apply(ctx, config) {
           continue;
         }
         for (const target of result.to) {
-          delivered.add(`${row.id} -> ${target}`);
+          announced.add(row.id);
           monitors.set(target, now);   // it is part of the watching now; not a suspect any more
           monitorsThisTick.add(target);
         }
@@ -873,6 +909,22 @@ export function apply(ctx, config) {
         recordNotification(row, result.to);
         ctx.logger?.info?.(`session-watch diagnosis ${row.id}: ${row.diagnosis.cause} (${row.signal}) — ${row.diagnosis.summary}`);
       }
+
+      /*
+       * Withhold the monitors from the stuck list LAST, because this tick is when some of them became
+       * monitors.
+       *
+       * `stuck` was filtered before any delivery, so a conversation woken a few lines above is still
+       * in it - and the notice would list a row the plugin has decided not to act on. A person cannot
+       * act on "I was told about this and told not to worry" either; the row teaches them to ignore
+       * the notice. Re-filtering here, once the monitor set is final for this tick, closes that gap.
+       *
+       * The count has to move with it: `counts.stuck` is what the UI summarises, and letting it keep
+       * counting withheld rows would make the snapshot contradict its own list.
+       */
+      next.stuck = next.stuck.filter((r) => !isMonitor(r.id, now));
+      next.counts.stuck = next.stuck.length;
+
       snapshot = next;
     } catch (error) {
       snapshot = { ...snapshot, at: Date.now(), reason: String(error?.message ?? error) };

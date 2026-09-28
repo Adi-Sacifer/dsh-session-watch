@@ -23,7 +23,7 @@
     "peek": "node scripts/peek-text.mjs",
     "pending": "node scripts/pending.mjs",
     "dump": "node scripts/dump-types.mjs",
-    "test": "node test/selftest.mjs && node test/plugin-selfcheck.mjs && node test/reload-safety.mjs && node test/notice-render.mjs && node test/notice-poll.mjs && node test/event-keepalive.mjs && node test/client-route-test.mjs && node test/diagnose-test.mjs && node test/notify-test.mjs && node test/mutual-watch-test.mjs && node test/budget-hold-test.mjs && node test/verify-installed.mjs",
+    "test": "node test/selftest.mjs && node test/plugin-selfcheck.mjs && node test/reload-safety.mjs && node test/notice-render.mjs && node test/notice-poll.mjs && node test/event-keepalive.mjs && node test/client-route-test.mjs && node test/diagnose-test.mjs && node test/notify-test.mjs && node test/mutual-watch-test.mjs && node test/budget-hold-test.mjs && node test/awaiting-human-test.mjs && node test/one-watcher-test.mjs && node test/verify-installed.mjs",
     "test:rules": "node test/selftest.mjs",
     "test:plugin": "node test/plugin-selfcheck.mjs",
     "test:reload": "node test/reload-safety.mjs",
@@ -33,6 +33,8 @@
     "test:notify": "node test/notify-test.mjs",
     "test:mutual": "node test/mutual-watch-test.mjs",
     "test:budget": "node test/budget-hold-test.mjs",
+    "test:human": "node test/awaiting-human-test.mjs",
+    "test:one-watcher": "node test/one-watcher-test.mjs",
     "test:installed": "node test/verify-installed.mjs",
     "test:poll": "node test/notice-poll.mjs",
     "test:events": "node test/event-keepalive.mjs"

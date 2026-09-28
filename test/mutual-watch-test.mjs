@@ -171,18 +171,32 @@ async function scenario(roots, config = {}) {
   const served = snapshotOf(s.host);
 
   /*
-   * The assertions below read `suppressed`, not `sessions[].state`.
+   * ONE conversation is woken, so ONE conversation becomes a monitor.
    *
-   * `sessions[].state` is the RAW verdict, and a monitor is deliberately still described as `working`
-   * there (its transcript is written to: the report it just received started a conversation). What
-   * this group is actually about is that the monitor is withheld from being a suspect and from being
-   * woken, so that is what gets asserted. An earlier version of this test asserted the raw verdict,
-   * which passed or failed for reasons that had nothing to do with the monitor rule.
+   * This group was written when every eligible root was notified, and asserted both were withheld.
+   * The fan-out is gone (see one-watcher-test.mjs), so exactly one of the two takes the report - and
+   * the point of the assertion is unchanged: whoever was woken is no longer a suspect. Which one it
+   * is depends on "most recently active", which this fixture does not pin, so the assertion counts
+   * rather than names.
    */
+  check('G2 exactly one conversation is woken', s.host.state.delivered.length, 1);
   const suppressed = (served.suppressed ?? []).map((x) => x.id).sort();
-  check('G2 both monitors are withheld as suspects', suppressed.join(','), 'monitor-1,monitor-2');
-  check('G2 no monitor appears in the stuck list',
-    served.stuck.filter((r) => /^monitor-/.test(r.id)).length, 0);
+  check('G2 the woken conversation is withheld as a suspect', suppressed.length, 1);
+  check('G2 ...and it is one of the two',
+    /^monitor-[12]$/.test(suppressed[0] ?? ''), true);
+  /*
+   * Only the WOKEN one is exempt, and only from being re-reported.
+   *
+   * This assertion used to say "no monitor appears in the stuck list" and expect zero - which was
+   * simply wrong, and the fixture proved it: the other conversation was never woken, so it is not a
+   * watchdog at all. In this fixture it is genuinely hung (an open turn silent for 60 minutes), and a
+   * genuinely hung conversation MUST stay on the list or the exemption becomes a way to hide hangs.
+   * What must hold is narrower and more useful: whoever took the report is not offered up again.
+   */
+  check('G2 the woken one is not listed as stuck again',
+    served.stuck.some((r) => r.id === suppressed[0]), false);
+  check('G2 ...while a conversation that was never woken is still reported',
+    served.stuck.some((r) => /^monitor-/.test(r.id)), true);
   check('G2 no monitor is woken again', s.host.state.delivered.length, afterFirst);
 
   for (let i = 0; i < 5; i++) s.host.state.tick();
@@ -256,17 +270,26 @@ async function scenario(roots, config = {}) {
   check('G4 a conversation that is mid-turn is not interrupted', toBusy, 0);
   const toIdle = s.host.state.delivered.filter((d) => d.to === 'idle-root').length;
   check('G4 the idle conversation is told instead', toIdle, 1);
+  /*
+   * ONE recipient, so there is nobody left to defer to.
+   *
+   * This group used to assert that the mid-turn root was skipped on tick 1 and told on tick 2, when
+   * the rule was "every eligible root hears about it". With one watcher per incident that second
+   * delivery must NOT happen: idle-root was free and took the message, the incident is closed, and a
+   * later nudge to busy-root would be the fan-out the user reported - just staggered by one tick.
+   */
+  check('G4 exactly one conversation is woken', s.host.state.delivered.length, 1);
 
   const served = snapshotOf(s.host);
   check('G4 the hung session is on screen for a person to act on',
     served.stuck.some((r) => r.id === 'sess-victim-2'), true);
   check('G4 the busy conversation itself is not called stuck', stateOf(served, 'busy-root'), 'working');
 
-  /* busy-root goes idle; the deferred report must arrive now. */
+  /* busy-root goes idle; the incident is already announced, so nothing new is sent. */
   writeHungTool(s.root, 'busy-root', 60 * MIN, now);
   s.host.state.tick();
-  check('G4 the deferred report arrives once it goes idle',
-    s.host.state.delivered.filter((d) => d.to === 'busy-root').length, 1);
+  check('G4 it is not told later either: the incident is already announced',
+    s.host.state.delivered.filter((d) => d.to === 'busy-root').length, 0);
 
   const total = s.host.state.delivered.length;
   for (let i = 0; i < 4; i++) s.host.state.tick();

@@ -265,7 +265,34 @@ try {
 } catch (error) {
   failures.push(`harness error: ${error?.message ?? error}`);
 } finally {
-  edge.kill();
+  /*
+   * Kill every process holding THIS test's profile directory.
+   *
+   * `edge.kill()` on the spawned handle is not enough, and neither is a tree kill: on Windows the
+   * launcher re-execs and exits, so the real Edge is re-parented away from the pid Node owns. A tree
+   * kill then reaps the launcher's (already empty) tree and leaves the browser and its gpu, network,
+   * storage, renderer and crashpad children running - measured at 11 surviving processes from one run,
+   * and 90 after a few runs, at which point they fight over the CDP port and make the next run fail
+   * for reasons that have nothing to do with the notice.
+   *
+   * The profile path is the one handle that stays with every process of this instance, and it is
+   * unique per run (`mkdtemp`), so matching on it cannot touch a browser the user has open. That is
+   * the whole reason this is safe to do from a test.
+   */
+  const killProfileProcesses = () => new Promise((resolve) => {
+    if (process.platform !== 'win32') { try { edge.kill(); } catch { } resolve(); return; }
+    const ps = [
+      "$procs = Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | " +
+      `Where-Object { $_.CommandLine -like '*${profileDir}*' }; ` +
+      'foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }',
+    ].join('');
+    const killer = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'ignore' });
+    killer.on('close', resolve);
+    killer.on('error', () => { try { edge.kill(); } catch { } resolve(); });
+  });
+
+  await killProfileProcesses();
+  try { edge.kill(); } catch { }
   server.close();
   await sleep(300);
   /*

@@ -126,9 +126,19 @@ function makeHost({ roots = [], withAgents = true } = {}) {
   check('it discloses what was read', /读了什么/.test(text), true);
   check('it offers next actions', /要我/.test(text), true);
 
-  /* every root that can be told hears about it, and the victim is never told about itself */
+  /*
+   * ONE conversation is told, not all of them.
+   *
+   * This used to read "every idle root conversation is told" and expect all three. That was the
+   * fan-out the user reported: "一次性还是会唤起一堆监工". The notice is for the person, and there is
+   * one person - so the contract is now exactly one recipient, with the ordering pinned by
+   * one-watcher-test.mjs. Here we only care that the single message goes to a real, eligible
+   * conversation and never to the victim.
+   */
   const targets = host.state.delivered.map((d) => d.to);
-  check('every idle root conversation is told', targets.sort().join(','), 'sess-observer,watcher-1,watcher-2');
+  check('exactly one conversation is told', targets.length, 1);
+  check('...and it is one of the idle roots',
+    ['sess-observer', 'watcher-1', 'watcher-2'].includes(targets[0]), true);
   check('the stuck session is never told about itself', targets.includes('sess-victim'), false);
 
   /* the same diagnosis must also be visible in the state the UI polls */
@@ -153,20 +163,22 @@ function makeHost({ roots = [], withAgents = true } = {}) {
   host.state.tick();
 
   /*
-   * One message per RECIPIENT, not one message total.
+   * The incident is the unit of work: ONE conversation is told, once, no matter how many ticks pass.
    *
-   * The contract is "this conversation has been told about this session, so do not tell it again".
-   * Repeating a tick must not produce a second message for anybody - that is the actual regression
-   * this section guards - and a recipient that was skipped while it was mid-turn is still allowed its
-   * one message when it becomes free. Asserting a flat total of 1 would forbid that legitimate,
-   * necessary delivery and would have made the "do not drop the alert" path untestable.
+   * This section used to assert "one message per RECIPIENT", which is what allowed the reported
+   * fan-out to survive: with a per-pair key, excluding the already-told recipient did not stop the
+   * alert, it MOVED it to the next candidate on the next tick - alice, then bob, then carol, one hang
+   * waking three conversations one per tick. The count is now per incident, so the right assertion is
+   * a flat total of one, and it must be the SAME conversation across ticks.
    */
   const perTarget = {};
   for (const d of host.state.delivered) perTarget[d.to] = (perTarget[d.to] ?? 0) + 1;
-  check('reported once per cause, not per tick',
+  check('one message for the whole incident, not one per tick',
+    host.state.delivered.length, 1);
+  check('...and it never repeats for that recipient',
     Object.values(perTarget).every((n) => n === 1), true);
-  check('the idle observer was told', perTarget['sess-observer'], 1);
-  check('and was not told again on the next two ticks', perTarget['watcher-1'], 1);
+  check('...and the recipient is a real idle conversation',
+    Object.keys(perTarget).every((k) => ['sess-observer', 'watcher-1'].includes(k)), true);
 }
 
 /* 3. diagnosis can be turned off, and then no message is sent */
